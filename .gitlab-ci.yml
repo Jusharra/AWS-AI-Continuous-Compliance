@@ -12,6 +12,7 @@ variables:
 # ------------------------------
 
 include:
+  - local: '.gitlab-ci-example.yml'
   # GitLab SAST template
   - template: Security/SAST.gitlab-ci.yml
   # GitLab DAST template
