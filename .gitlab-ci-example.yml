@@ -1,0 +1,55 @@
+stages:
+  - security
+  - import_findings
+
+variables:
+  # Use the project-level variables you configured in GitLab:
+  AWS_DEFAULT_REGION: $AWS_REGION
+
+# ------------------------------------------
+# 1) SECURITY SCAN STAGE (placeholder)
+# ------------------------------------------
+# In a real setup you'd use GitLab's SAST/DAST templates.
+# For now, this job just drops minimal JSON files so the next
+# job has something to read. You can swap this with real scan jobs later.
+
+security_scans:
+  stage: security
+  image: alpine:3.20
+  script:
+    - echo "Running placeholder security scans..."
+    - echo '{"vulnerabilities": []}' > gl-sast-report.json
+    - echo '{"vulnerabilities": []}' > gl-dast-report.json
+  artifacts:
+    paths:
+      - gl-sast-report.json
+      - gl-dast-report.json
+    expire_in: 1 day
+  only:
+    - main
+
+# ------------------------------------------
+# 2) IMPORT FINDINGS INTO AWS SECURITY HUB
+# ------------------------------------------
+
+import_findings_to_security_hub:
+  stage: import_findings
+  image: python:3.11
+  needs:
+    - job: security_scans
+  variables:
+    AWS_DEFAULT_REGION: $AWS_REGION
+    AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID
+    AWS_ROLE_ARN: $AWS_ROLE_ARN
+    # GitLab OIDC → AWS
+    AWS_WEB_IDENTITY_TOKEN_FILE: $CI_JOB_JWT_FILE
+  script:
+    - python --version
+    - pip install boto3
+    - ls -la
+    - ls -la scripts || echo "scripts directory not found"
+    - cat gl-sast-report.json || echo "no SAST report"
+    - cat gl-dast-report.json || echo "no DAST report"
+    - python scripts/gitlab_to_asff.py
+  only:
+    - main
