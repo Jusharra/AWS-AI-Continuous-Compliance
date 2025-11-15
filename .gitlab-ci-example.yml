@@ -5,13 +5,17 @@ stages:
 variables:
   AWS_DEFAULT_REGION: $AWS_REGION
 
+# ------------------------------------------
+# 1) SECURITY SCAN STAGE (placeholder)
+# ------------------------------------------
 security_scans:
   stage: security
   image: alpine:3.20
   script:
     - echo "Running placeholder security scans..."
-    - touch gl-sast-report.json
-    - touch gl-dast-report.json
+    # Minimal valid JSON so downstream parsing never explodes
+    - echo '{ "vulnerabilities": [] }' > gl-sast-report.json
+    - echo '{ "vulnerabilities": [] }' > gl-dast-report.json
   artifacts:
     paths:
       - gl-sast-report.json
@@ -20,16 +24,20 @@ security_scans:
   only:
     - main
 
+
+# ------------------------------------------
+# 2) IMPORT FINDINGS INTO AWS SECURITY HUB
+# ------------------------------------------
 import_findings_to_security_hub:
   stage: import_findings
   image: python:3.11
   needs:
-    - job: security_scans
+    - security_scans
   variables:
     AWS_DEFAULT_REGION: $AWS_REGION
     AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID
     AWS_ROLE_ARN: $AWS_ROLE_ARN
-    AWS_WEB_IDENTITY_TOKEN_FILE: $CI_JOB_JWT_FILE
+    AWS_WEB_IDENTITY_TOKEN_FILE: $CI_JOB_JWT
   script:
     - python --version
     - pip install boto3
