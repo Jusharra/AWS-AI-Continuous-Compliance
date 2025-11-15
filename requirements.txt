@@ -1,7 +1,23 @@
+# === Core AWS / Infra ===
 boto3==1.34.131
 pyyaml==6.0.2
-pandas==2.2.2
+
+# === Data & Templates ===
+#pandas==2.2.2
 jinja2==3.1.4
+
+# === Dev & QA ===
 pytest==8.2.1
 flake8==7.1.0
 pre-commit==3.7.1
+
+# === App / Frontend ===
+streamlit==1.38.0
+python-dotenv==1.0.1
+
+# === RAG / Embeddings ===
+pinecone-client==5.0.0
+sentence-transformers==3.0.1
+
+# === Reports / PDFs (for auditor exec reports if you run locally) ===
+xlsxwriter==3.2.0

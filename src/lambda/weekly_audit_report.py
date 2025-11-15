@@ -1,0 +1,300 @@
+"""weekly_audit_report.py
+
+Purpose
+====================================================================
+This file implements the **“Friday Excel”** Lambda. Its goal is to remove
+the weekly grind of manually downloading screenshots and exporting CSV files
+for your auditors. The Lambda performs five high-level steps every time it runs:
+
+1. Download assessment metadata from AWS Audit Manager.
+2. Gather evidence for each control (via evidence folders and items).
+3. Calculate compliance status per control.
+4. Generate an Excel workbook with multiple sheets using pandas + xlsxwriter.
+5. Store the report in S3 and notify recipients via SES.
+"""
+
+import json
+import boto3
+import pandas as pd
+from datetime import datetime, timedelta
+from io import BytesIO
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AuditReportGenerator:
+    """Generates comprehensive SOC 2 audit reports from AWS Audit Manager evidence."""
+    
+    def __init__(self, region: str = "us-east-1"):
+        self.region = region
+        self.audit_manager = boto3.client("auditmanager", region_name=region)
+        self.s3 = boto3.client("s3", region_name=region)
+        self.ses = boto3.client("ses", region_name=region)
+
+        # Configuration - pulled from environment variables
+        self.assessment_id = os.environ.get(
+            "ASSESSMENT_ID", "12345678-abcd-efgh-ijkl-1234567890ab"
+        )
+        self.s3_bucket = os.environ.get("S3_BUCKET", "fafo-audit-reports")
+        self.report_recipients = os.environ.get(
+            "REPORT_RECIPIENTS", "auditor@example.com"
+        ).split(",")
+        self.sender_email = os.environ.get(
+            "SENDER_EMAIL", "grc-automation@example.com"
+        )
+
+    def fetch_assessment_evidence(self):
+        """Retrieve complete assessment structure from AWS Audit Manager."""
+        try:
+            logger.info(f"Fetching assessment {self.assessment_id}")
+            response = self.audit_manager.get_assessment(
+                assessmentId=self.assessment_id
+            )
+            assessment = response["assessment"]
+            logger.info(
+                "Retrieved assessment with %d control sets",
+                len(assessment["framework"]["controlSets"]),
+            )
+            return assessment
+        except Exception as e:
+            logger.error(f"Error fetching assessment: {e}")
+            raise
+
+    def collect_evidence_by_control(self, control_sets):
+        """Collect the latest evidence for each SOC 2 control."""
+        evidence_records = []
+        evidence_cutoff = datetime.utcnow() - timedelta(days=7)
+
+        for cs in control_sets:
+            logger.info(f"Processing control set: {cs.get('name')}")
+            for control in cs.get("controls", []):
+                try:
+                    folders = self.audit_manager.get_evidence_folders_by_assessment_control(
+                        assessmentId=self.assessment_id,
+                        controlSetId=cs["id"],
+                        controlId=control["id"],
+                    ).get("evidenceFolders", [])
+
+                    if not folders:
+                        evidence_records.append(
+                            self._create_placeholder_record(cs, control)
+                        )
+                        continue
+
+                    latest_evidence = []
+                    for folder in folders:
+                        if datetime.strptime(folder["date"], "%Y-%m-%d") >= evidence_cutoff.date():
+                            items = self._fetch_evidence_items(
+                                cs["id"], control["id"], folder["id"]
+                            )
+                            latest_evidence.extend(
+                                self._process_evidence_items(
+                                    items, cs, control, folder
+                                )
+                            )
+
+                    # If nothing recent, take most recent folder
+                    if not latest_evidence:
+                        latest_folder = max(folders, key=lambda x: x["date"])
+                        items = self._fetch_evidence_items(
+                            cs["id"], control["id"], latest_folder["id"]
+                        )
+                        latest_evidence.extend(
+                            self._process_evidence_items(
+                                items, cs, control, latest_folder
+                            )
+                        )
+
+                    evidence_records.extend(latest_evidence)
+
+                except Exception as e:
+                    logger.warning(
+                        "Error processing control %s: %s", control["id"], e
+                    )
+                    evidence_records.append(
+                        self._create_placeholder_record(cs, control, str(e))
+                    )
+
+        logger.info("Collected %d evidence records", len(evidence_records))
+        return evidence_records
+
+    def _process_evidence_items(self, items, cs, control, folder):
+        processed = []
+        for item in items:
+            processed.append(
+                {
+                    "ControlSetName": cs.get("name"),
+                    "ControlId": control["id"],
+                    "ControlName": control.get("name"),
+                    "EvidenceDate": folder.get("date"),
+                    "EvidenceType": item.get("dataSource"),
+                    "ComplianceStatus": self._determine_compliance_status(item),
+                    "Finding": item.get("textResponse", ""),
+                    "ResourceArn": self._extract_resource_arn(item),
+                    "Severity": self._extract_severity(item),
+                }
+            )
+        return processed
+
+    def _fetch_evidence_items(self, cs_id, ctrl_id, folder_id):
+        try:
+            return self.audit_manager.get_evidence_by_evidence_folder(
+                assessmentId=self.assessment_id,
+                controlSetId=cs_id,
+                evidenceFolderId=folder_id,
+            ).get("evidence", [])
+        except Exception as e:
+            logger.warning(f"Error fetching evidence items: {e}")
+            return []
+
+    def _create_placeholder_record(self, cs, control, reason: str = "No evidence found"):
+        return {
+            "ControlSetName": cs.get("name"),
+            "ControlId": control["id"],
+            "ControlName": control.get("name"),
+            "EvidenceDate": "No Evidence",
+            "EvidenceType": "Manual Review Required",
+            "ComplianceStatus": "UNKNOWN",
+            "Finding": reason,
+            "ResourceArn": "N/A",
+            "Severity": "LOW",
+        }
+
+    def _determine_compliance_status(self, evidence):
+        if "complianceCheck" in evidence:
+            return evidence["complianceCheck"].get("status", "UNKNOWN").upper()
+        if "findingComplianceStatus" in evidence.get("attributes", {}):
+            return evidence["attributes"]["findingComplianceStatus"].upper()
+        return "UNKNOWN"
+
+    def _extract_resource_arn(self, evidence):
+        res = evidence.get("resourcesIncluded", [])
+        return res[0].get("arn", "N/A") if res else "N/A"
+
+    def _extract_severity(self, evidence):
+        if "findingSeverity" in evidence.get("attributes", {}):
+            return evidence["attributes"]["findingSeverity"].upper()
+        return (
+            "MEDIUM"
+            if self._determine_compliance_status(evidence) == "FAILED"
+            else "LOW"
+        )
+
+    def generate_excel_report(self, evidence_records):
+        df = pd.DataFrame(evidence_records)
+        if df.empty:
+            df = pd.DataFrame(
+                [self._create_placeholder_record({}, {"id": "N/A", "name": "N/A"})]
+            )
+
+        excel_buffer = BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
+            self._create_executive_summary_sheet(df, writer)
+            self._create_control_status_sheet(df, writer)
+            self._create_failed_findings_sheet(df, writer)
+            df.to_excel(writer, sheet_name="All Evidence Details", index=False)
+        excel_buffer.seek(0)
+        return excel_buffer
+
+    def _create_executive_summary_sheet(self, df, writer):
+        total = df["ControlId"].nunique()
+        passed = df[df["ComplianceStatus"] == "PASSED"]["ControlId"].nunique()
+        failed = df[df["ComplianceStatus"] == "FAILED"]["ControlId"].nunique()
+        rate = (passed / total * 100) if total > 0 else 0
+        summary_df = pd.DataFrame(
+            {
+                "Metric": [
+                    "Total Controls",
+                    "Passing",
+                    "Failing",
+                    "Compliance Rate (%)",
+                    "Generated",
+                ],
+                "Value": [
+                    total,
+                    passed,
+                    failed,
+                    f"{rate:.1f}%",
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                ],
+            }
+        )
+        summary_df.to_excel(
+            writer, sheet_name="Executive Summary", index=False
+        )
+
+    def _create_control_status_sheet(self, df, writer):
+        status_df = (
+            df.groupby(["ControlSetName", "ControlId", "ControlName"])
+            .agg(
+                ComplianceStatus=("ComplianceStatus", "first"),
+                EvidenceDate=("EvidenceDate", "max"),
+            )
+            .reset_index()
+        )
+        status_df.to_excel(writer, sheet_name="Control Status", index=False)
+
+    def _create_failed_findings_sheet(self, df, writer):
+        failed_df = df[df["ComplianceStatus"].isin(["FAILED", "WARNING"])].copy()
+        if failed_df.empty:
+            failed_df = pd.DataFrame([{"Status": "No failed findings"}])
+        else:
+            sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            failed_df["SevSort"] = failed_df["Severity"].map(sev_order)
+            failed_df = failed_df.sort_values("SevSort")
+        failed_df.to_excel(writer, sheet_name="Failed Findings", index=False)
+
+    def store_report_in_s3(self, excel_buffer):
+        date_path = datetime.now().strftime("%Y/%m/%d")
+        filename = f"SOC2_Weekly_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        s3_key = f"weekly-reports/{date_path}/{filename}"
+        self.s3.put_object(
+            Bucket=self.s3_bucket, Key=s3_key, Body=excel_buffer.getvalue()
+        )
+        logger.info("Stored report in S3: s3://%s/%s", self.s3_bucket, s3_key)
+        return s3_key
+
+    def send_notification(self, s3_key):
+        presigned_url = self.s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.s3_bucket, "Key": s3_key},
+            ExpiresIn=604800,
+        )
+        subject = f"Weekly SOC 2 Audit Report - {datetime.now().strftime('%Y-%m-%d')}"
+        body = (
+            "The weekly SOC 2 compliance report is ready.\n\n"
+            f"Download (expires in 7 days):\n{presigned_url}"
+        )
+        self.ses.send_email(
+            Source=self.sender_email,
+            Destination={"ToAddresses": self.report_recipients},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": body}},
+            },
+        )
+        logger.info(
+            "Sent notifications to %d recipients", len(self.report_recipients)
+        )
+
+def lambda_handler(event, context):
+    try:
+        logger.info("Starting weekly audit report generation")
+        generator = AuditReportGenerator()
+        assessment = generator.fetch_assessment_evidence()
+        evidence = generator.collect_evidence_by_control(
+            assessment["framework"]["controlSets"]
+        )
+        report = generator.generate_excel_report(evidence)
+        s3_key = generator.store_report_in_s3(report)
+        generator.send_notification(s3_key)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Report generated successfully"}),
+        }
+    except Exception as e:
+        logger.error("Failed to generate report: %s", e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}

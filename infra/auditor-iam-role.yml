@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FAFO auditor IAM role with read-only Audit Manager access
+
+Parameters:
+  TrustedPrincipalArn:
+    Type: String
+    Description: ARN of the principal allowed to assume this role (e.g., SSO or IAM user)
+
+Resources:
+  FafoAuditorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: fafo-auditor-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      Description: Read-only SOC 2 / ISO 27001 auditor role for FAFO
+      Policies:
+        - PolicyName: fafo-auditor-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AuditManagerReadOnlyAccess
+                Effect: Allow
+                Action:
+                  - auditmanager:GetAssessment
+                  - auditmanager:GetAssessmentFramework
+                  - auditmanager:GetControl
+                  - auditmanager:GetEvidence
+                  - auditmanager:GetEvidenceByEvidenceFolder
+                  - auditmanager:GetEvidenceFoldersByAssessment
+                  - auditmanager:GetEvidenceFoldersByAssessmentControl
+                  - auditmanager:ListAssessments
+                  - auditmanager:ListAssessmentFrameworks
+                Resource: '*'
+              - Sid: BasicConsoleAccess
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Sid: DenyAllWriteOperations
+                Effect: Deny
+                Action:
+                  - auditmanager:Create*
+                  - auditmanager:Update*
+                  - auditmanager:Delete*
+                  - auditmanager:Put*
+                Resource: '*'
+
+Outputs:
+  FafoAuditorRoleArn:
+    Description: ARN of the FAFO auditor role
+    Value: !GetAtt FafoAuditorRole.Arn

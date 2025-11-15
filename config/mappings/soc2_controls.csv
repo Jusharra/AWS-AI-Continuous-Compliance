@@ -1,0 +1,14 @@
+control_id,trust_category,description,aws_signal,primary_service,evidence_location
+CC6.1,Security (Logical Access),Logical access is restricted to authorized users only,Config rule: fafo-iam-password-policy,AWS Config,S3://<EVIDENCE_BUCKET>/reports/iam_password_policy.csv
+CC6.2,Security (Logical Access),User access is provisioned and deprovisioned based on role,Security Hub: IAM.1 / IAM.2,Security Hub,S3://<EVIDENCE_BUCKET>/reports/iam_findings.csv
+CC6.3,Security (Logical Access),Privileged access is restricted and monitored,Security Hub: IAM.3 / Access Analyzer,Security Hub / Access Analyzer,S3://<EVIDENCE_BUCKET>/reports/access_analyzer_findings.csv
+CC7.1,System Operations,Infrastructure is monitored for security events,Security Hub summary + CloudTrail enabled,Security Hub / CloudTrail,S3://<EVIDENCE_BUCKET>/reports/cloudtrail_findings.csv
+CC7.2,System Operations,Deviations from baselines are detected and investigated,AWS Config non-compliant rules,AWS Config,S3://<EVIDENCE_BUCKET>/reports/config_noncompliant.csv
+CC7.3,System Operations,Corrective actions are implemented for identified issues,Remediation Lambda logs,Lambda / CloudWatch,S3://<EVIDENCE_BUCKET>/reports/remediation_actions.csv
+CC7.4,System Operations,Security incidents are logged and retained,CloudTrail multi-region trail,CloudTrail,S3://<EVIDENCE_BUCKET>/cloudtrail/
+CC8.1,Change Management,Changes are authorized and tested before deployment,GitLab MR approvals + SAST/DAST,GitLab CI,S3://<EVIDENCE_BUCKET>/gitlab/security_scans/
+CC8.2,Change Management,Changes to infrastructure are tracked,IaC in Git + Config history,Git / AWS Config,S3://<EVIDENCE_BUCKET>/reports/change_log.csv
+A1.1,Availability,Monitoring supports availability objectives,Security Hub checks on critical services,Security Hub,S3://<EVIDENCE_BUCKET>/reports/availability_checks.csv
+A1.2,Availability,Backups and redundancy are in place,Config rules for backup/encryption,AWS Config,S3://<EVIDENCE_BUCKET>/reports/backup_controls.csv
+C1.1,Confidentiality,Sensitive data is identified and classified,S3 public access checks + tagging,Security Hub / Config,S3://<EVIDENCE_BUCKET>/reports/s3_confidentiality.csv
+C1.2,Confidentiality,Encryption protects confidentiality of data,S3 / RDS encryption checks,AWS Config / Security Hub,S3://<EVIDENCE_BUCKET>/reports/encryption_findings.csv

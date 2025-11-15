@@ -1,0 +1,32 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EventBridge schedule for FAFO weekly SOC 2 audit report Lambda
+
+Parameters:
+  WeeklyAuditReportLambdaArn:
+    Type: String
+    Description: ARN of the fafo-weekly-audit-report Lambda function
+
+Resources:
+  WeeklyAuditReportSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: fafo-weekly-audit-report-schedule
+      Description: Run the FAFO weekly SOC 2 audit report every Friday
+      ScheduleExpression: cron(0 9 ? * FRI *) # Friday 09:00 UTC (adjust as needed)
+      State: ENABLED
+      Targets:
+        - Id: WeeklyAuditReportTarget
+          Arn: !Ref WeeklyAuditReportLambdaArn
+
+  AllowEventsToInvokeWeeklyReport:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WeeklyAuditReportLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyAuditReportSchedule.Arn
+
+Outputs:
+  WeeklyAuditReportScheduleArn:
+    Description: EventBridge rule ARN for the weekly report
+    Value: !GetAtt WeeklyAuditReportSchedule.Arn

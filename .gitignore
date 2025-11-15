@@ -1,7 +1,46 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# Environment variables
+.env
+.env.local
+*.env
+
+# AWS credentials
+*.pem
+*.key
+*.crt
+
+# Node/Streamlit cache
+.streamlit/
+.cache/
+
+# Evidence files
+grc_report_*.csv
+evidence/
+reports/
 *.zip
-build/
-dist/
+*.xlsx
+*.json
+
+# Lambda build packages
+lambda/*.zip
+
+# OS Files
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.windsurf\rules\snyk_rules.md
