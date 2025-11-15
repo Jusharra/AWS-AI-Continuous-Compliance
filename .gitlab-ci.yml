@@ -16,36 +16,8 @@ security_scans:
     - pip install bandit
     # Run SAST against your src/ tree
     - bandit -r src -f json -o bandit-report.json || true
-
-    # Convert Bandit JSON -> GitLab-style SAST report gl-sast-report.json
-    - python - << 'EOF'
-      import json, pathlib
-
-      src = pathlib.Path("bandit-report.json")
-      if not src.exists() or not src.read_text().strip():
-          data = {"vulnerabilities": []}
-      else:
-          raw = json.loads(src.read_text())
-          vulns = []
-          for issue in raw.get("results", []):
-              vulns.append({
-                  "id": issue.get("test_id"),
-                  "name": issue.get("test_name"),
-                  "description": issue.get("issue_text"),
-                  "severity": issue.get("issue_severity", "Info").title(),
-                  "location": {
-                      "file": issue.get("filename"),
-                      "line": issue.get("line_number"),
-                  },
-                  "solution": issue.get("test_id"),
-              })
-          data = {"vulnerabilities": vulns}
-
-      pathlib.Path("gl-sast-report.json").write_text(json.dumps(data))
-
-      # DAST placeholder – will be replaced by real ZAP scan
-      pathlib.Path("gl-dast-report.json").write_text('{"vulnerabilities": []}')
-      EOF
+    # Convert Bandit output -> gl-sast-report.json + gl-dast-report.json
+    - python scripts/bandit_to_gitlab.py
   artifacts:
     paths:
       - gl-sast-report.json
@@ -74,6 +46,7 @@ import_findings_to_security_hub:
     - ls -la scripts || echo "scripts directory not found"
     - cat gl-sast-report.json || echo "no SAST report"
     - cat gl-dast-report.json || echo "no DAST report"
+    - python scripts/gitlab_to_gitlab.py || echo "converter script not found"
     - python scripts/gitlab_to_asff.py
   only:
     - main
