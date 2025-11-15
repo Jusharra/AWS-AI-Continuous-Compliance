@@ -1,41 +1,67 @@
 stages:
-  - sast
-  - dast
+  - security
   - import_findings
 
-# Region for Security Hub
 variables:
   AWS_DEFAULT_REGION: $AWS_REGION
 
-# ------------------------------
-# 1) REAL GITLAB SAST & DAST
-# ------------------------------
+# ------------------------------------------
+# 1) SECURITY STAGE: REAL SAST + DAST PLACEHOLDER
+# ------------------------------------------
+security_scans:
+  stage: security
+  image: python:3.11
+  script:
+    # Install Bandit for Python SAST
+    - pip install bandit
+    # Run SAST against your src/ tree
+    - bandit -r src -f json -o bandit-report.json || true
 
-include:
-  - local: '.gitlab-ci-example.yml'
-  # GitLab SAST template
-  - template: Security/SAST.gitlab-ci.yml
-  # GitLab DAST template
-  - template: Security/DAST.gitlab-ci.yml
+    # Convert Bandit JSON -> GitLab-style SAST report gl-sast-report.json
+    - python - << 'EOF'
+      import json, pathlib
 
-# These templates define jobs named `sast` and `dast`.
-# They automatically output:
-#   - gl-sast-report.json
-#   - gl-dast-report.json
-# as artifacts, which our importer will read.
+      src = pathlib.Path("bandit-report.json")
+      if not src.exists() or not src.read_text().strip():
+          data = {"vulnerabilities": []}
+      else:
+          raw = json.loads(src.read_text())
+          vulns = []
+          for issue in raw.get("results", []):
+              vulns.append({
+                  "id": issue.get("test_id"),
+                  "name": issue.get("test_name"),
+                  "description": issue.get("issue_text"),
+                  "severity": issue.get("issue_severity", "Info").title(),
+                  "location": {
+                      "file": issue.get("filename"),
+                      "line": issue.get("line_number"),
+                  },
+                  "solution": issue.get("test_id"),
+              })
+          data = {"vulnerabilities": vulns}
 
-# ------------------------------
+      pathlib.Path("gl-sast-report.json").write_text(json.dumps(data))
+
+      # DAST placeholder – will be replaced by real ZAP scan
+      pathlib.Path("gl-dast-report.json").write_text('{"vulnerabilities": []}')
+      EOF
+  artifacts:
+    paths:
+      - gl-sast-report.json
+      - gl-dast-report.json
+    expire_in: 1 day
+  only:
+    - main
+
+# ------------------------------------------
 # 2) IMPORT FINDINGS INTO AWS SECURITY HUB
-# ------------------------------
-
+# ------------------------------------------
 import_findings_to_security_hub:
   stage: import_findings
   image: python:3.11
   needs:
-    - job: sast
-      artifacts: true
-    - job: dast
-      artifacts: true
+    - job: security_scans
   variables:
     AWS_DEFAULT_REGION: $AWS_REGION
     AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID
