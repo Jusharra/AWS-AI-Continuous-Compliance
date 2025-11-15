@@ -1,2 +1,52 @@
+stages:
+  - sast
+  - dast
+  - import_findings
+
+# Region for Security Hub
+variables:
+  AWS_DEFAULT_REGION: $AWS_REGION
+
+# ------------------------------
+# 1) REAL GITLAB SAST & DAST
+# ------------------------------
+
 include:
-  - local: '.gitlab-ci-example.yml'
+  # GitLab SAST template
+  - template: Security/SAST.gitlab-ci.yml
+  # GitLab DAST template
+  - template: Security/DAST.gitlab-ci.yml
+
+# These templates define jobs named `sast` and `dast`.
+# They automatically output:
+#   - gl-sast-report.json
+#   - gl-dast-report.json
+# as artifacts, which our importer will read.
+
+# ------------------------------
+# 2) IMPORT FINDINGS INTO AWS SECURITY HUB
+# ------------------------------
+
+import_findings_to_security_hub:
+  stage: import_findings
+  image: python:3.11
+  needs:
+    - job: sast
+      artifacts: true
+    - job: dast
+      artifacts: true
+  variables:
+    AWS_DEFAULT_REGION: $AWS_REGION
+    AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID
+    AWS_ROLE_ARN: $AWS_ROLE_ARN
+    AWS_WEB_IDENTITY_TOKEN_FILE: $CI_JOB_JWT
+  script:
+    - python --version
+    - pip install boto3
+    - ls -la
+    - ls -la scripts || echo "scripts directory not found"
+    - cat gl-sast-report.json || echo "no SAST report"
+    - cat gl-dast-report.json || echo "no DAST report"
+    - python scripts/gitlab_to_asff.py
+  only:
+    - main
