@@ -12,10 +12,18 @@ security_scans:
   stage: security
   image: alpine:3.20
   script:
-    - echo "Running placeholder security scans..."
-    # Minimal valid JSON so downstream parsing never explodes
-    - echo '{ "vulnerabilities": [] }' > gl-sast-report.json
-    - echo '{ "vulnerabilities": [] }' > gl-dast-report.json
+    - |
+      echo "Running placeholder security scans..."
+
+      # Write minimal valid JSON for SAST
+      cat << 'EOF' > gl-sast-report.json
+      { "vulnerabilities": [] }
+      EOF
+
+      # Write minimal valid JSON for DAST
+      cat << 'EOF' > gl-dast-report.json
+      { "vulnerabilities": [] }
+      EOF
   artifacts:
     paths:
       - gl-sast-report.json
