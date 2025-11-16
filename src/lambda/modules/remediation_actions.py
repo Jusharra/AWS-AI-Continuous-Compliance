@@ -119,7 +119,32 @@ def handle_finding(finding: Dict[str, Any]) -> str:
     Returns a status string describing what happened.
     """
     control_id = _extract_control_id(finding)
-    logger.info("Handling finding %s (control_id=%s)", finding.get("Id"), control_id)
+
+    # 🔹 NEW: pull config rule + map to SOC 2 CC6.x where relevant
+    product_fields = finding.get("ProductFields", {}) or {}
+    config_rule = product_fields.get("ConfigRuleName", "") or ""
+
+    # default to whatever Security Hub gave us
+    mapped_soc2 = control_id
+
+    if config_rule == "iam-user-mfa-enabled":
+        mapped_soc2 = "CC6.3"   # Logical access – MFA for users
+    elif config_rule == "iam-root-access-key-check":
+        mapped_soc2 = "CC6.5"   # Root account hardening
+    elif config_rule == "iam-password-policy":
+        mapped_soc2 = "CC6.4"   # Password policy strength
+
+    # stash this on the finding so _record_evidence / indexer can see it
+    finding["MappedSoc2ControlId"] = mapped_soc2
+    finding["ConfigRuleName"] = config_rule
+
+    logger.info(
+        "Handling finding %s (control_id=%s, mapped_soc2=%s, config_rule=%s)",
+        finding.get("Id"),
+        control_id,
+        mapped_soc2,
+        config_rule,
+    )
 
     # Expand this mapping as you add more auto-fixes
     if control_id in ("S3.1", "S3_BUCKET_PUBLIC_READ_PROHIBITED"):
@@ -134,3 +159,4 @@ def handle_finding(finding: Dict[str, Any]) -> str:
         _update_finding_status(finding, status)
 
     return status
+

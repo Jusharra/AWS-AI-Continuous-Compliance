@@ -20,10 +20,9 @@ from dotenv import load_dotenv
 from pinecone import Pinecone, Index
 from anthropic import Anthropic
 import re
-from retriever_hybrid import pinecone_hybrid_search, build_sparse_vector
-from pinecone_text.sparse import BM25Encoder
+#from pinecone_text.sparse import BM25Encoder
 
-bm25 = BM25Encoder().default()
+#bm25 = BM25Encoder().default()
 
 # -----------------------------
 # Environment & Clients
@@ -32,6 +31,11 @@ bm25 = BM25Encoder().default()
 load_dotenv()
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+WEEKLY_LAMBDA_NAME = os.environ.get(
+    "WEEKLY_REPORT_LAMBDA",
+    "fafo-weekly-audit-report"  # whatever your weekly_audit_report Lambda is named
+)
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", AWS_REGION)
 EMBED_MODEL_ID = os.environ.get("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
 
@@ -53,8 +57,14 @@ anthropic_client = Anthropic(api_key=anthropic_key)
 # -----------------------------
 
 def embed_text(text: str) -> List[float]:
-    """Generate a Titan v2 embedding for the query text."""
-    body = json.dumps({"inputText": text})
+    """Call Amazon Titan Text Embeddings via Bedrock."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        # Fallback so we *never* send empty text to Bedrock
+        cleaned = "generic compliance question"
+        # or: cleaned = "SOC 2 AWS evidence query"
+
+    body = json.dumps({"inputText": cleaned})
     resp = bedrock.invoke_model(
         modelId=EMBED_MODEL_ID,
         body=body,
@@ -62,11 +72,15 @@ def embed_text(text: str) -> List[float]:
         accept="application/json",
     )
     resp_body = json.loads(resp["body"].read())
+
+    # Titan v2 formats
     if "embedding" in resp_body:
         return resp_body["embedding"]
     if "embeddingsByType" in resp_body and "float" in resp_body["embeddingsByType"]:
         return resp_body["embeddingsByType"]["float"]
-    raise RuntimeError(f"Unexpected Titan embedding response: {resp_body}")
+
+    raise RuntimeError(f"Unexpected embedding response format: {resp_body.keys()}")
+
 
 def extract_control_ids(question: str) -> list[str]:
     matches = CONTROL_ID_REGEX.findall(question)
@@ -76,34 +90,6 @@ def extract_control_ids(question: str) -> list[str]:
 # -----------------------------
 # Pinecone Search
 # -----------------------------
-def pinecone_hybrid_search(index, query_text: str, top_k: int = 8):
-    # dense embedding via Titan (same as index)
-    dense = embed_text(query_text)  # reuse your existing Bedrock embed helper
-    # sparse embedding via BM25
-    sparse = bm25.encode_queries(query_text)
-
-    res = index.query(
-        vector=dense,
-        sparse_vector=sparse,
-        top_k=top_k,
-        include_metadata=True,
-    )
-
-    hits = []
-    for m in res.matches or []:
-        md = m.metadata or {}
-        hits.append(
-            {
-                "score": float(m.score),
-                "text": md.get("text", ""),
-                "framework": md.get("framework", "SOC2"),
-                "control_id": md.get("control_id", ""),
-                "area": md.get("area", ""),
-                "iso_control_id": md.get("iso_control_id", ""),
-                "s3_uri": md.get("s3_uri", ""),
-            }
-        )
-    return hits
 
 def search_evidence(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
     """Embed the query and search Pinecone for top-k evidence chunks.
@@ -124,8 +110,6 @@ def search_evidence(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
         filter=filter_obj,   # only applied when control_ids is non-empty
     )
     return res.matches or []
-
-
 
 def format_context_for_prompt(matches: List[Dict[str, Any]]) -> str:
     """Render Pinecone matches into a textual context block for the LLM."""
@@ -243,7 +227,7 @@ def claude_answer(question: str, matches: List[Dict[str, Any]]) -> str:
 
 def main():
     st.set_page_config(
-        page_title="FAFO Inc. Continuous Compliance – Auditor Q&A",
+        page_title="FAFO Inc Continuous Compliance – Auditor Q&A",
         layout="wide",
     )
 
@@ -272,23 +256,54 @@ def main():
         ),
         height=140,
     )
+        # --- Weekly report trigger (Audit Manager → S3) ---
+    st.subheader("Generate fresh weekly report")
+
+    if st.button("Run weekly Audit Manager export"):
+        with st.spinner("Invoking weekly_audit_report Lambda..."):
+            try:
+                resp = lambda_client.invoke(
+                    FunctionName=WEEKLY_LAMBDA_NAME,
+                    InvocationType="RequestResponse",
+                )
+                payload_raw = resp.get("Payload")
+                payload = json.loads(payload_raw.read()) if payload_raw else {}
+
+                excel_key = payload.get("excel_report_key")
+                csv_key = payload.get("csv_summary_key")
+
+                msg_lines = []
+                if excel_key:
+                    msg_lines.append(f"Excel report: `s3://{os.environ.get('FAFO_EVIDENCE_BUCKET', '')}/{excel_key}`")
+                if csv_key:
+                    msg_lines.append(f"CSV summary: `s3://{os.environ.get('FAFO_EVIDENCE_BUCKET', '')}/{csv_key}`")
+
+                if msg_lines:
+                    st.success("Weekly report Lambda completed:\n\n" + "\n".join(msg_lines))
+                else:
+                    st.warning(f"Lambda ran but returned no keys. Raw payload: {payload}")
+
+            except Exception as e:
+                st.error(f"Error invoking weekly report Lambda: {e}")
 
     if st.button("Run Query", type="primary"):
         if not query.strip():
             st.warning("Please enter a question first.")
-            return
+            st.stop()
 
         with st.spinner("Retrieving evidence from Pinecone and generating answer with Claude..."):
             try:
-                matches = pinecone_hybrid_search(index, query, top_k=top_k)
+                matches = search_evidence(query, top_k=top_k)
             except Exception as e:
                 st.error(f"Error searching Pinecone: {e}")
-                return
+                st.stop()
 
             if not matches:
                 st.warning("No evidence was retrieved from the knowledge base.")
-                return
+                st.stop()
 
+            # Claude still gets the raw matches list; your claude_answer function
+            # can pull `m.metadata["text"]`, `framework`, `control_id`, etc.
             answer = claude_answer(query, matches)
 
         col1, col2 = st.columns([2, 1])

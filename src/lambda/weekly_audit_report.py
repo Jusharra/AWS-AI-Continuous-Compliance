@@ -86,14 +86,14 @@ class AuditReportGenerator:
 
         # Configuration - pulled from environment variables
         self.assessment_id = os.environ.get(
-            "ASSESSMENT_ID", "12345678-abcd-efgh-ijkl-1234567890ab"
+            "ASSESSMENT_ID", "faeae42c-09e6-4251-a0e3-28e5e021fcd2"
         )
         self.s3_bucket = os.environ.get("S3_BUCKET", "fafo-audit-reports")
         self.report_recipients = os.environ.get(
             "REPORT_RECIPIENTS", "auditor@example.com"
         ).split(",")
         self.sender_email = os.environ.get(
-            "SENDER_EMAIL", "grc-automation@example.com"
+            "SENDER_EMAIL", "1stchoicecyber@gmail.com"
         )
 
     def fetch_assessment_evidence(self):
@@ -249,7 +249,7 @@ class AuditReportGenerator:
         excel_buffer.seek(0)
         return excel_buffer
 
-        def generate_csv_summary_and_store(self, evidence_records):
+    def generate_csv_summary_and_store(self, evidence_records):
             """
             Write a slimmed-down CSV for RAG indexing.
 
@@ -260,75 +260,73 @@ class AuditReportGenerator:
             - control_id matches your SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
             - framework can be read from soc2_controls.csv if present (else defaults to SOC2)
             """
-        if not evidence_records:
-            logger.warning("No evidence records – CSV summary will be empty placeholder.")
-            evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
+            if not evidence_records:
+                logger.warning("No evidence records – CSV summary will be empty placeholder.")
+                evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
 
-        # Load your 28-control mapping once
-        soc2_mapping = load_soc2_mapping()
+            # Load your 28-control mapping once
+            soc2_mapping = load_soc2_mapping()
 
-        csv_buffer = StringIO()
-        fieldnames = [
-            "framework",
-            "control_id",
-            "service",
-            "severity",
-            "summary",
-            "details",
-            "timestamp",
-        ]
-        writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
-        writer.writeheader()
+            csv_buffer = StringIO()
+            fieldnames = [
+                "framework",
+                "control_id",
+                "service",
+                "severity",
+                "summary",
+                "details",
+                "timestamp",
+            ]
+            writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+            writer.writeheader()
 
-        for rec in evidence_records:
-            # Derive normalized SOC2 control ID
-            soc2_id = infer_soc2_control_id(rec, soc2_mapping)
+            for rec in evidence_records:
+                # Derive normalized SOC2 control ID
+                soc2_id = infer_soc2_control_id(rec, soc2_mapping)
 
-            # Derive service from ResourceArn if present
-            arn = rec.get("ResourceArn", "") or ""
-            if "s3" in arn:
-                service = "S3"
-            elif "config" in arn:
-                service = "Config"
-            elif "securityhub" in arn:
-                service = "SecurityHub"
-            elif "lambda" in arn:
-                service = "Lambda"
-            else:
-                service = "Unknown"
+                # Derive service from ResourceArn if present
+                arn = rec.get("ResourceArn", "") or ""
+                if "s3" in arn:
+                    service = "S3"
+                elif "config" in arn:
+                    service = "Config"
+                elif "securityhub" in arn:
+                    service = "SecurityHub"
+                elif "lambda" in arn:
+                    service = "Lambda"
+                else:
+                    service = "Unknown"
 
-            # Pull framework from mapping if available; default to SOC2
-            meta = soc2_mapping.get(soc2_id, {})
-            framework = meta.get("framework", "SOC2")
+                # Pull framework from mapping if available; default to SOC2
+                meta = soc2_mapping.get(soc2_id, {})
+                framework = meta.get("framework", "SOC2")
 
-            writer.writerow(
-                {
-                    "framework": framework,
-                    "control_id": soc2_id,
-                    "service": service,
-                    "severity": rec.get("Severity", "LOW"),
-                    "summary": rec.get("Finding", ""),
-                    "details": f"{rec.get('ControlName','')} in {rec.get('ControlSetName','')} – {rec.get('EvidenceType','')}",
-                    "timestamp": rec.get("EvidenceDate", ""),
-                }
+                writer.writerow(
+                    {
+                        "framework": framework,
+                        "control_id": soc2_id,
+                        "service": service,
+                        "severity": rec.get("Severity", "LOW"),
+                        "summary": rec.get("Finding", ""),
+                        "details": f"{rec.get('ControlName','')} in {rec.get('ControlSetName','')} – {rec.get('EvidenceType','')}",
+                        "timestamp": rec.get("EvidenceDate", ""),
+                    }
+                )
+
+            csv_buffer.seek(0)
+
+            date_path = datetime.now().strftime("%Y/%m/%d")
+            filename = f"SOC2_Weekly_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            s3_key = f"weekly/{date_path}/{filename}"
+
+            self.s3.put_object(
+                Bucket=self.s3_bucket,
+                Key=s3_key,
+                Body=csv_buffer.getvalue().encode("utf-8"),
+                ContentType="text/csv",
             )
-
-        csv_buffer.seek(0)
-
-        date_path = datetime.now().strftime("%Y/%m/%d")
-        filename = f"SOC2_Weekly_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        s3_key = f"weekly/{date_path}/{filename}"
-
-        self.s3.put_object(
-            Bucket=self.s3_bucket,
-            Key=s3_key,
-            Body=csv_buffer.getvalue().encode("utf-8"),
-            ContentType="text/csv",
-        )
-        logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
-        return s3_key
-
-    
+            logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
+            return s3_key
 
     def _create_executive_summary_sheet(self, df, writer):
         total = df["ControlId"].nunique()

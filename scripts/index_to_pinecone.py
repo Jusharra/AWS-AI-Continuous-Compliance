@@ -28,9 +28,9 @@ from typing import Dict, List, Tuple
 import boto3
 import botocore
 from pinecone import Pinecone, ServerlessSpec, Index
-from pinecone_text.sparse import BM25Encoder
+#from pinecone_text.sparse import BM25Encoder
 
-bm25 = BM25Encoder().default()
+#bm25 = BM25Encoder().default()
 
 
 # -----------------------------
@@ -281,30 +281,25 @@ def index_all():
         key = obj["Key"]
         if not key.endswith(".json"):
             continue
-        chunks.extend(build_chunks_from_remediation_json(key))
+        chunks.extend(build_chunks_from_remediation_json(key, mapping))
 
     if not chunks:
         print("[INFO] No vectors to upsert – nothing indexed.")
         return
 
-    # --- Hybrid vectors: dense + sparse ---
-    texts = [content for _, content, _ in chunks]
-    bm25.fit(texts)
-    sparse_list = bm25.encode_documents(texts)
-
+    # --- Dense vectors only (Titan embeddings) ---
     vectors = []
-    for (doc_id, content, metadata), sparse in zip(chunks, sparse_list):
+    for (doc_id, content, metadata) in chunks:
         dense = embed_text(content)
         vectors.append(
             {
                 "id": doc_id,
-                "values": dense,          # dense embedding (Titan)
-                "sparse_values": sparse,  # lexical BM25 terms
+                "values": dense,      # dense embedding (Titan)
                 "metadata": metadata,
             }
         )
 
-    print(f"[INFO] Upserting {len(vectors)} hybrid vectors into {PINECONE_INDEX_NAME}...")
+    print(f"[INFO] Upserting {len(vectors)} vectors into {PINECONE_INDEX_NAME}...")
     batch_size = 100
     for i in range(0, len(vectors), batch_size):
         index.upsert(vectors=vectors[i : i + batch_size])
