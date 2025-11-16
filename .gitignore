@@ -36,7 +36,7 @@ src/lambda/*.zip
 # Lambda build artifacts
 *.zip
 src/lambda/lambda_build/
-src/lambda/lambda/modules/
+src/lambda/modules/
 src/lambda/**/*.dist-info/
 
 
