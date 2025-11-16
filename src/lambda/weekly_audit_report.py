@@ -22,10 +22,58 @@ import logging
 import os
 import csv
 from io import StringIO
+from pathlib import Path
+
+MAPPING_PATH = Path(__file__).resolve().parents[2] / "config" / "mappings" / "soc2_controls.csv"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def load_soc2_mapping():
+    """
+    Load your existing 28-control mapping from config/mappings/soc2_controls.csv.
+    We DO NOT change that CSV; we only read it.
+    """
+    mapping = {}
+    if not MAPPING_PATH.exists():
+        logger.warning(f"SOC2 mapping file not found at {MAPPING_PATH} – weekly CSV will use raw ControlId.")
+        return mapping
+
+    with MAPPING_PATH.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cid = (row.get("soc2_control_id") or "").strip()
+            if not cid:
+                continue
+            mapping[cid] = row
+    logger.info("Loaded %d SOC2 controls from %s", len(mapping), MAPPING_PATH)
+    return mapping
+
+
+def infer_soc2_control_id(rec, mapping):
+    """
+    Try to normalize an Audit Manager control record to one of your 28 SOC2 IDs.
+
+    Strategy:
+    - If ControlId already equals one of your SOC2 IDs (CC6.1, A1.3, etc.), use it.
+    - Else look for any SOC2 ID substring in ControlName or ControlSetName.
+    - Fallback: return the raw ControlId (not ideal, but won’t break anything).
+    """
+    raw = (rec.get("ControlId") or "").strip()
+    if raw in mapping:
+        return raw
+
+    name_blob = " ".join([
+        rec.get("ControlName", "") or "",
+        rec.get("ControlSetName", "") or "",
+    ])
+
+    for cid in mapping.keys():
+        if cid in name_blob:
+            return cid
+
+    return raw  # fallback – still lets index_to_pinecone run, but won’t map cleanly
 
 class AuditReportGenerator:
     """Generates comprehensive SOC 2 audit reports from AWS Audit Manager evidence."""
@@ -201,16 +249,23 @@ class AuditReportGenerator:
         excel_buffer.seek(0)
         return excel_buffer
 
-    def generate_csv_summary_and_store(self, evidence_records):
-        """
-        Write a slimmed-down CSV for RAG indexing.
+        def generate_csv_summary_and_store(self, evidence_records):
+            """
+            Write a slimmed-down CSV for RAG indexing.
 
-        Columns:
-        - framework, control_id, service, severity, summary, details, timestamp
-        """
+            Columns:
+            - framework, control_id, service, severity, summary, details, timestamp
+
+            Now normalized so:
+            - control_id matches your SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
+            - framework can be read from soc2_controls.csv if present (else defaults to SOC2)
+            """
         if not evidence_records:
             logger.warning("No evidence records – CSV summary will be empty placeholder.")
             evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
+
+        # Load your 28-control mapping once
+        soc2_mapping = load_soc2_mapping()
 
         csv_buffer = StringIO()
         fieldnames = [
@@ -226,6 +281,9 @@ class AuditReportGenerator:
         writer.writeheader()
 
         for rec in evidence_records:
+            # Derive normalized SOC2 control ID
+            soc2_id = infer_soc2_control_id(rec, soc2_mapping)
+
             # Derive service from ResourceArn if present
             arn = rec.get("ResourceArn", "") or ""
             if "s3" in arn:
@@ -239,10 +297,14 @@ class AuditReportGenerator:
             else:
                 service = "Unknown"
 
+            # Pull framework from mapping if available; default to SOC2
+            meta = soc2_mapping.get(soc2_id, {})
+            framework = meta.get("framework", "SOC2")
+
             writer.writerow(
                 {
-                    "framework": "SOC2",
-                    "control_id": rec.get("ControlId", ""),
+                    "framework": framework,
+                    "control_id": soc2_id,
                     "service": service,
                     "severity": rec.get("Severity", "LOW"),
                     "summary": rec.get("Finding", ""),
@@ -265,6 +327,7 @@ class AuditReportGenerator:
         )
         logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
         return s3_key
+
     
 
     def _create_executive_summary_sheet(self, df, writer):

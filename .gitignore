@@ -33,6 +33,12 @@ reports/
 
 # Lambda build packages
 lambda/*.zip
+# Lambda build artifacts
+*.zip
+src/lambda_build/
+src/lambda/modules/
+src/lambda/**/*.dist-info/
+
 
 # OS Files
 .DS_Store

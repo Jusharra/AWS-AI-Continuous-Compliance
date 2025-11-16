@@ -19,6 +19,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from pinecone import Pinecone, Index
 from anthropic import Anthropic
+import re
 
 # -----------------------------
 # Environment & Clients
@@ -35,6 +36,7 @@ PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "fafo-compliance-kb"
 
 anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 CLAUDE_MODEL_ID = "claude-sonnet-4-5-20250929"
+CONTROL_ID_REGEX = re.compile(r"\b(CC\d+\.\d+|C\d+\.\d+|A\.\d+\.\d+)\b", re.IGNORECASE)
 
 bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -62,20 +64,35 @@ def embed_text(text: str) -> List[float]:
         return resp_body["embeddingsByType"]["float"]
     raise RuntimeError(f"Unexpected Titan embedding response: {resp_body}")
 
+def extract_control_ids(question: str) -> list[str]:
+    matches = CONTROL_ID_REGEX.findall(question)
+    # Normalize like CC6.3, CC7.2 etc.
+    return [m.upper().replace("A.", "A.").replace("C", "C") for m in matches]
 
 # -----------------------------
 # Pinecone Search
 # -----------------------------
 
 def search_evidence(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
-    """Embed the query and search Pinecone for top-k evidence chunks."""
+    """Embed the query and search Pinecone for top-k evidence chunks.
+       If the question references specific controls (CC6.3, CC7.x, A.*, C.*),
+       use a metadata filter on control_id to tighten relevance.
+    """
+    control_ids = extract_control_ids(query)
     query_vec = embed_text(query)
+
+    filter_obj = None
+    if control_ids:
+        filter_obj = {"control_id": {"$in": control_ids}}
+
     res = index.query(
         vector=query_vec,
         top_k=top_k,
         include_metadata=True,
+        filter=filter_obj,   # only applied when control_ids is non-empty
     )
     return res.matches or []
+
 
 
 def format_context_for_prompt(matches: List[Dict[str, Any]]) -> str:
