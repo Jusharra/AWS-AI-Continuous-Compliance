@@ -32,11 +32,11 @@ reports/
 *.json
 
 # Lambda build packages
-lambda/*.zip
+src/lambda/*.zip
 # Lambda build artifacts
 *.zip
-src/lambda_build/
-src/lambda/modules/
+src/lambda/lambda_build/
+src/lambda/lambda/modules/
 src/lambda/**/*.dist-info/
 
 
