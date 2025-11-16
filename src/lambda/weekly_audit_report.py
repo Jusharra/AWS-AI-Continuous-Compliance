@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import logging
 import os
+import csv
+from io import StringIO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -199,6 +201,72 @@ class AuditReportGenerator:
         excel_buffer.seek(0)
         return excel_buffer
 
+    def generate_csv_summary_and_store(self, evidence_records):
+        """
+        Write a slimmed-down CSV for RAG indexing.
+
+        Columns:
+        - framework, control_id, service, severity, summary, details, timestamp
+        """
+        if not evidence_records:
+            logger.warning("No evidence records – CSV summary will be empty placeholder.")
+            evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
+
+        csv_buffer = StringIO()
+        fieldnames = [
+            "framework",
+            "control_id",
+            "service",
+            "severity",
+            "summary",
+            "details",
+            "timestamp",
+        ]
+        writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for rec in evidence_records:
+            # Derive service from ResourceArn if present
+            arn = rec.get("ResourceArn", "") or ""
+            if "s3" in arn:
+                service = "S3"
+            elif "config" in arn:
+                service = "Config"
+            elif "securityhub" in arn:
+                service = "SecurityHub"
+            elif "lambda" in arn:
+                service = "Lambda"
+            else:
+                service = "Unknown"
+
+            writer.writerow(
+                {
+                    "framework": "SOC2",
+                    "control_id": rec.get("ControlId", ""),
+                    "service": service,
+                    "severity": rec.get("Severity", "LOW"),
+                    "summary": rec.get("Finding", ""),
+                    "details": f"{rec.get('ControlName','')} in {rec.get('ControlSetName','')} – {rec.get('EvidenceType','')}",
+                    "timestamp": rec.get("EvidenceDate", ""),
+                }
+            )
+
+        csv_buffer.seek(0)
+
+        date_path = datetime.now().strftime("%Y/%m/%d")
+        filename = f"SOC2_Weekly_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        s3_key = f"weekly/{date_path}/{filename}"
+
+        self.s3.put_object(
+            Bucket=self.s3_bucket,
+            Key=s3_key,
+            Body=csv_buffer.getvalue().encode("utf-8"),
+            ContentType="text/csv",
+        )
+        logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
+        return s3_key
+    
+
     def _create_executive_summary_sheet(self, df, writer):
         total = df["ControlId"].nunique()
         passed = df[df["ComplianceStatus"] == "PASSED"]["ControlId"].nunique()
@@ -248,14 +316,13 @@ class AuditReportGenerator:
         failed_df.to_excel(writer, sheet_name="Failed Findings", index=False)
 
     def store_report_in_s3(self, excel_buffer):
-        date_path = datetime.now().strftime("%Y/%m/%d")
+        date_path = datetime.now().strftime('%Y/%m/%d')
         filename = f"SOC2_Weekly_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        s3_key = f"weekly-reports/{date_path}/{filename}"
-        self.s3.put_object(
-            Bucket=self.s3_bucket, Key=s3_key, Body=excel_buffer.getvalue()
-        )
-        logger.info("Stored report in S3: s3://%s/%s", self.s3_bucket, s3_key)
+        s3_key = f"weekly/{date_path}/{filename}"
+        self.s3.put_object(Bucket=self.s3_bucket, Key=s3_key, Body=excel_buffer.getvalue())
+        logger.info(f"Stored report in S3: s3://{self.s3_bucket}/{s3_key}")
         return s3_key
+
 
     def send_notification(self, s3_key):
         presigned_url = self.s3.generate_presigned_url(
@@ -281,20 +348,20 @@ class AuditReportGenerator:
         )
 
 def lambda_handler(event, context):
-    try:
-        logger.info("Starting weekly audit report generation")
-        generator = AuditReportGenerator()
-        assessment = generator.fetch_assessment_evidence()
-        evidence = generator.collect_evidence_by_control(
-            assessment["framework"]["controlSets"]
-        )
-        report = generator.generate_excel_report(evidence)
-        s3_key = generator.store_report_in_s3(report)
-        generator.send_notification(s3_key)
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"message": "Report generated successfully"}),
-        }
-    except Exception as e:
-        logger.error("Failed to generate report: %s", e)
-        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+    generator = AuditReportGenerator(region=os.environ.get("AWS_REGION", "us-east-1"))
+    assessment = generator.fetch_assessment_evidence()
+    evidence_records = generator.collect_evidence_by_control(assessment)
+
+    excel_buffer = generator.generate_excel_report(evidence_records)
+    s3_excel_key = generator.store_report_in_s3(excel_buffer)
+
+    csv_key = generator.generate_csv_summary_and_store(evidence_records)
+
+    generator.send_notification(s3_excel_key)
+    logger.info(f"Weekly Lambda completed. Excel: {s3_excel_key}, CSV: {csv_key}")
+    return {
+        "excel_report_key": s3_excel_key,
+        "csv_summary_key": csv_key,
+        "record_count": len(evidence_records),
+    }
+
