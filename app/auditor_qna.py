@@ -20,6 +20,10 @@ from dotenv import load_dotenv
 from pinecone import Pinecone, Index
 from anthropic import Anthropic
 import re
+from retriever_hybrid import pinecone_hybrid_search, build_sparse_vector
+from pinecone_text.sparse import BM25Encoder
+
+bm25 = BM25Encoder().default()
 
 # -----------------------------
 # Environment & Clients
@@ -72,6 +76,34 @@ def extract_control_ids(question: str) -> list[str]:
 # -----------------------------
 # Pinecone Search
 # -----------------------------
+def pinecone_hybrid_search(index, query_text: str, top_k: int = 8):
+    # dense embedding via Titan (same as index)
+    dense = embed_text(query_text)  # reuse your existing Bedrock embed helper
+    # sparse embedding via BM25
+    sparse = bm25.encode_queries(query_text)
+
+    res = index.query(
+        vector=dense,
+        sparse_vector=sparse,
+        top_k=top_k,
+        include_metadata=True,
+    )
+
+    hits = []
+    for m in res.matches or []:
+        md = m.metadata or {}
+        hits.append(
+            {
+                "score": float(m.score),
+                "text": md.get("text", ""),
+                "framework": md.get("framework", "SOC2"),
+                "control_id": md.get("control_id", ""),
+                "area": md.get("area", ""),
+                "iso_control_id": md.get("iso_control_id", ""),
+                "s3_uri": md.get("s3_uri", ""),
+            }
+        )
+    return hits
 
 def search_evidence(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
     """Embed the query and search Pinecone for top-k evidence chunks.
@@ -138,26 +170,27 @@ def format_context_for_prompt(matches: List[Dict[str, Any]]) -> str:
 # -----------------------------
 
 SYSTEM_PROMPT = """
-You are a senior GRC engineer and AI governance auditor for FAFO, a SaaS company running in AWS.
+You are a senior GRC engineer answering auditor-style questions using SOC 2 and ISO 27001 evidence from Pinecone.
 
-You are helping external and internal auditors understand how FAFO maintains continuous compliance
-for SOC 2 (with focus on CC6.x Logical Access, CC7.x Change Management and System Operations,
-CC8.x Monitoring, and A- and C-series for Availability and Confidentiality), and ISO 27001.
+Rules:
+- Always ground answers in the retrieved chunks (Security Hub, Config, Audit Manager, weekly CSVs, remediation JSON).
+- Make the mapping explicit:
+  - SOC 2 CC6.x  → Logical access controls (identity, MFA, RBAC, least privilege).
+  - SOC 2 CC7.x  → Change management (CI/CD, infra-as-code, controlled releases).
+  - SOC 2 CC8.x  → System operations (monitoring, incident handling, remediation).
+  - A1.x         → Availability controls.
+  - C1.x         → Confidentiality controls.
 
-You are given:
-- Retrieved evidence chunks from a RAG knowledge base (weekly reports, remediation logs, Audit Manager exports).
-- Each chunk includes framework, control_id, area, TSC domain, ISO mapping, service, severity, S3 evidence link, and a textual summary.
+When you answer:
+1) Start with a short executive summary in auditor language.
+2) Then map to controls (CC6.x / CC7.x / CC8.x / A1.x / C1.x and ISO 27001 IDs) using the metadata fields:
+   - control_id, tsc_domain, area, iso_control_id, aws_mechanism_type, aws_mechanism.
+3) Call out which AWS evidence you used:
+   - Security Hub findings, Config rules, Audit Manager assessments, weekly reports CSV, remediation JSON, etc.
+4) If evidence is missing or incomplete, explicitly say what is missing and what evidence would be needed.
 
-Your job:
-- Answer the auditor's question using ONLY the provided context.
-- Explicitly tie your explanation back to specific controls (e.g., CC6.1, CC7.2, A.9.2.3, etc.).
-- Explain what the control is, how FAFO enforces/monitors it technically (Config, Security Hub, Audit Manager, Lambda, SCPs),
-  and where the evidence lives (e.g., S3 evidence path, weekly report, remediation file, Audit Manager assessment).
-- Be concise and structured, but detailed enough for an external auditor or CISO to understand the control design and operation.
-- If the question asks about a time period, reference timestamps in the context where possible.
-- If you do not have enough evidence in the context, clearly say so and recommend what additional evidence would be needed.
-
-Never invent controls or evidence. If it's not in the context, say that it is not available in the retrieved evidence.
+Never invent control mappings that are not present in the metadata.
+If a question is about CC6.3, prefer chunks whose control_id = CC6.3.
 """.strip()
 
 
@@ -210,7 +243,7 @@ def claude_answer(question: str, matches: List[Dict[str, Any]]) -> str:
 
 def main():
     st.set_page_config(
-        page_title="FAFO Continuous Compliance – Auditor Q&A",
+        page_title="FAFO Inc. Continuous Compliance – Auditor Q&A",
         layout="wide",
     )
 
@@ -247,7 +280,7 @@ def main():
 
         with st.spinner("Retrieving evidence from Pinecone and generating answer with Claude..."):
             try:
-                matches = search_evidence(query, top_k=top_k)
+                matches = pinecone_hybrid_search(index, query, top_k=top_k)
             except Exception as e:
                 st.error(f"Error searching Pinecone: {e}")
                 return

@@ -28,6 +28,10 @@ from typing import Dict, List, Tuple
 import boto3
 import botocore
 from pinecone import Pinecone, ServerlessSpec, Index
+from pinecone_text.sparse import BM25Encoder
+
+bm25 = BM25Encoder().default()
+
 
 # -----------------------------
 # ENV + GLOBALS
@@ -145,19 +149,20 @@ def build_chunks_from_weekly_csv(key: str, mapping: Dict[str, Dict]) -> List[Tup
     s3_uri = f"s3://{EVIDENCE_BUCKET}/{key}"
     text = fetch_object_text(key)
     rows = list(csv.DictReader(text.splitlines()))
-
-    chunks = []
+    chunks: List[Tuple[str, str, Dict]] = []
 
     for i, row in enumerate(rows):
         control_id = row.get("control_id", "").strip() or row.get("ControlId", "").strip()
         mapped = mapping.get(control_id, {})
 
-        # Merge mapping + row data
-        framework = mapped.get("framework", "SOC2")
+        framework = mapped.get("framework", "SOC2") or "SOC2"
         tsc_domain = mapped.get("tsc_domain", "")
         area = mapped.get("area", "")
         iso_control_id = mapped.get("iso_control_id", "")
-        service = row.get("service") or mapped.get("aws_mechanism_type", "Unknown")
+        aws_mechanism_type = mapped.get("aws_mechanism_type", "")
+        aws_mechanism = mapped.get("aws_mechanism", "")
+
+        service = row.get("service", mapped.get("aws_mechanism_type", "Unknown"))
         severity = row.get("severity", "Info")
         ts = row.get("timestamp", "")
 
@@ -167,6 +172,8 @@ def build_chunks_from_weekly_csv(key: str, mapping: Dict[str, Dict]) -> List[Tup
             f"TSC Domain: {tsc_domain}\n"
             f"Area: {area}\n"
             f"ISO Control: {iso_control_id}\n"
+            f"AWS Mechanism Type: {aws_mechanism_type}\n"
+            f"AWS Mechanism: {aws_mechanism}\n"
             f"Service: {service}\n"
             f"Severity: {severity}\n"
             f"Summary: {row.get('summary','')}\n"
@@ -176,20 +183,21 @@ def build_chunks_from_weekly_csv(key: str, mapping: Dict[str, Dict]) -> List[Tup
         )
 
         metadata = {
-            "framework": framework,
-            "control_id": control_id,
-            "tsc_domain": tsc_domain,
-            "area": area,
-            "iso_control_id": iso_control_id,
+            "framework": framework,            # SOC2
+            "control_id": control_id,          # CC6.3, CC7.2, A1.4, etc
+            "tsc_domain": tsc_domain,          # Security (CC), Availability (A), Confidentiality (C)
+            "area": area,                      # Logical Access / Change Management / System Operations / Availability / Confidentiality
+            "iso_control_id": iso_control_id,  # A.9.2.3, A.12.1.3, ...
+            "aws_mechanism_type": aws_mechanism_type,
+            "aws_mechanism": aws_mechanism,
             "service": service,
             "severity": severity,
             "s3_uri": s3_uri,
-            "timestamp": ts,
             "source": "weekly_report",
+            "timestamp": ts,
             "line": i,
             "text": body,
         }
-
         doc_id = f"{key}#row-{i}"
         chunks.append((doc_id, body, metadata))
 
@@ -255,36 +263,51 @@ def build_chunks_from_remediation_json(key: str, mapping: Dict[str, Dict]) -> Li
 def index_all():
     mapping = load_soc2_mapping()
     index = ensure_index()
-    vectors = []
 
-    # Weekly summaries (CSV)
-    weekly_objs = list_s3_objects("weekly/")
+    weekly_objs = list_s3_objects(prefix="weekly/")
+    remediation_objs = list_s3_objects(prefix="remediation/")
+
+    chunks = []
+
+    # 1) Weekly CSV chunks
     for obj in weekly_objs:
         key = obj["Key"]
-        if key.endswith(".csv"):
-            for doc_id, content, metadata in build_chunks_from_weekly_csv(key, mapping):
-                emb = embed_text(content)
-                vectors.append({"id": doc_id, "values": emb, "metadata": metadata})
+        if not key.endswith(".csv"):
+            continue
+        chunks.extend(build_chunks_from_weekly_csv(key, mapping))
 
-    # Remediation evidence (JSON)
-    remediation_objs = list_s3_objects("remediation/")
+    # 2) Remediation JSON chunks
     for obj in remediation_objs:
         key = obj["Key"]
-        if key.endswith(".json"):
-            for doc_id, content, metadata in build_chunks_from_remediation_json(key, mapping):
-                emb = embed_text(content)
-                vectors.append({"id": doc_id, "values": emb, "metadata": metadata})
+        if not key.endswith(".json"):
+            continue
+        chunks.extend(build_chunks_from_remediation_json(key))
 
-    if not vectors:
+    if not chunks:
         print("[INFO] No vectors to upsert – nothing indexed.")
         return
 
-    print(f"[INFO] Upserting {len(vectors)} vectors into Pinecone index {PINECONE_INDEX_NAME}...")
-    batch_size = 100
+    # --- Hybrid vectors: dense + sparse ---
+    texts = [content for _, content, _ in chunks]
+    bm25.fit(texts)
+    sparse_list = bm25.encode_documents(texts)
 
+    vectors = []
+    for (doc_id, content, metadata), sparse in zip(chunks, sparse_list):
+        dense = embed_text(content)
+        vectors.append(
+            {
+                "id": doc_id,
+                "values": dense,          # dense embedding (Titan)
+                "sparse_values": sparse,  # lexical BM25 terms
+                "metadata": metadata,
+            }
+        )
+
+    print(f"[INFO] Upserting {len(vectors)} hybrid vectors into {PINECONE_INDEX_NAME}...")
+    batch_size = 100
     for i in range(0, len(vectors), batch_size):
-        batch = vectors[i:i+batch_size]
-        index.upsert(vectors=batch)
+        index.upsert(vectors=vectors[i : i + batch_size])
         print(f"[INFO] Upserted batch {i//batch_size + 1}")
 
     print("[INFO] Indexing complete.")
