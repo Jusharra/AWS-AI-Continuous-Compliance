@@ -111,7 +111,7 @@ class AuditReportGenerator:
         )
         self.s3_bucket = os.environ.get("S3_BUCKET", "fafo-audit-reports")
         self.report_recipients = os.environ.get(
-            "REPORT_RECIPIENTS", "auditor@example.com"
+            "REPORT_RECIPIENTS", "qjgoree@gmail.com"
         ).split(",")
         self.sender_email = os.environ.get("SENDER_EMAIL", "1stchoicecyber@gmail.com")
 
@@ -401,9 +401,15 @@ def lambda_handler(event, context):
     # CSV-only report (no pandas/xlsxwriter/Excel)
     csv_key = generator.generate_csv_summary_and_store(evidence_records)
 
-    generator.send_notification(csv_key)
-    logger.info("Weekly Lambda completed. CSV: %s", csv_key)
+# Don’t let SES failures break the function
+    try:
+        generator.send_notification(csv_key)
+    except Exception as e:
+        logger.warning(f"SES notification failed: {e}")
+
+    logger.info(f"Weekly Lambda completed. CSV: {csv_key}")
     return {
         "csv_summary_key": csv_key,
         "record_count": len(evidence_records),
     }
+
