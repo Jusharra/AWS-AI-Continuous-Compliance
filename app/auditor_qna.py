@@ -51,7 +51,8 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 index: Index = pc.Index(PINECONE_INDEX_NAME)
 anthropic_client = Anthropic(api_key=anthropic_key)
 
-
+S3_EVIDENCE_BUCKET = os.environ.get("FAFO_EVIDENCE_BUCKET", "")
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 # -----------------------------
 # Embeddings (Bedrock Titan)
 # -----------------------------
@@ -92,22 +93,13 @@ def extract_control_ids(question: str) -> list[str]:
 # -----------------------------
 
 def search_evidence(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
-    """Embed the query and search Pinecone for top-k evidence chunks.
-       If the question references specific controls (CC6.3, CC7.x, A.*, C.*),
-       use a metadata filter on control_id to tighten relevance.
-    """
-    control_ids = extract_control_ids(query)
+    """Embed the query and search Pinecone for top-k evidence chunks."""
     query_vec = embed_text(query)
-
-    filter_obj = None
-    if control_ids:
-        filter_obj = {"control_id": {"$in": control_ids}}
 
     res = index.query(
         vector=query_vec,
         top_k=top_k,
         include_metadata=True,
-        filter=filter_obj,   # only applied when control_ids is non-empty
     )
     return res.matches or []
 
@@ -269,6 +261,8 @@ def main():
                 payload_raw = resp.get("Payload")
                 payload = json.loads(payload_raw.read()) if payload_raw else {}
 
+                st.write("Lambda payload:", payload)
+
                 excel_key = payload.get("excel_report_key")
                 csv_key = payload.get("csv_summary_key")
 
@@ -278,10 +272,27 @@ def main():
                 if csv_key:
                     msg_lines.append(f"CSV summary: `s3://{os.environ.get('FAFO_EVIDENCE_BUCKET', '')}/{csv_key}`")
 
-                if msg_lines:
-                    st.success("Weekly report Lambda completed:\n\n" + "\n".join(msg_lines))
-                else:
-                    st.warning(f"Lambda ran but returned no keys. Raw payload: {payload}")
+                if excel_key:
+                    try:
+                        excel_url = s3_client.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": S3_EVIDENCE_BUCKET, "Key": excel_key},
+                            ExpiresIn=3600,
+                        )
+                        st.markdown(f"[Download Excel report 📊]({excel_url})")
+                    except Exception as e:
+                        st.warning(f"Could not generate Excel download link: {e}")
+
+                if csv_key:
+                    try:
+                        csv_url = s3_client.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": S3_EVIDENCE_BUCKET, "Key": csv_key},
+                            ExpiresIn=3600,
+                        )
+                        st.markdown(f"[Download CSV summary 🧾]({csv_url})")
+                    except Exception as e:
+                        st.warning(f"Could not generate CSV download link: {e}")
 
             except Exception as e:
                 st.error(f"Error invoking weekly report Lambda: {e}")

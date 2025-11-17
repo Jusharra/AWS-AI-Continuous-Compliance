@@ -2,42 +2,55 @@
 
 Purpose
 ====================================================================
-This file implements the **“Friday Excel”** Lambda. Its goal is to remove
+This file implements the **“Friday Report”** Lambda. Its goal is to remove
 the weekly grind of manually downloading screenshots and exporting CSV files
-for your auditors. The Lambda performs five high-level steps every time it runs:
+for your auditors. The Lambda performs these steps:
 
 1. Download assessment metadata from AWS Audit Manager.
 2. Gather evidence for each control (via evidence folders and items).
 3. Calculate compliance status per control.
-4. Generate an Excel workbook with multiple sheets using pandas + xlsxwriter.
-5. Store the report in S3 and notify recipients via SES.
+4. Generate a weekly CSV summary aligned with your SOC 2 control mapping.
+5. Store the CSV in S3 under weekly/ and notify recipients via SES.
 """
 
+import csv
 import json
-import boto3
-import pandas as pd
-from datetime import datetime, timedelta
-from io import BytesIO
 import logging
 import os
-import csv
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
+from typing import Dict, List, Any
 
-MAPPING_PATH = Path(__file__).resolve().parents[2] / "config" / "mappings" / "soc2_controls.csv"
+import boto3
 
-# Configure logging
+# -------------------------------------------------------------------
+# Paths & logging
+# -------------------------------------------------------------------
+
+MAPPING_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "mappings" / "soc2_controls.csv"
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def load_soc2_mapping():
+
+# -------------------------------------------------------------------
+# SOC 2 mapping helpers
+# -------------------------------------------------------------------
+
+def load_soc2_mapping() -> Dict[str, Dict[str, str]]:
     """
     Load your existing 28-control mapping from config/mappings/soc2_controls.csv.
     We DO NOT change that CSV; we only read it.
     """
-    mapping = {}
+    mapping: Dict[str, Dict[str, str]] = {}
     if not MAPPING_PATH.exists():
-        logger.warning(f"SOC2 mapping file not found at {MAPPING_PATH} – weekly CSV will use raw ControlId.")
+        logger.warning(
+            "SOC2 mapping file not found at %s – weekly CSV will use raw ControlId.",
+            MAPPING_PATH,
+        )
         return mapping
 
     with MAPPING_PATH.open("r", encoding="utf-8") as f:
@@ -47,37 +60,45 @@ def load_soc2_mapping():
             if not cid:
                 continue
             mapping[cid] = row
+
     logger.info("Loaded %d SOC2 controls from %s", len(mapping), MAPPING_PATH)
     return mapping
 
 
-def infer_soc2_control_id(rec, mapping):
+def infer_soc2_control_id(rec: Dict[str, Any], mapping: Dict[str, Dict]) -> str:
     """
-    Try to normalize an Audit Manager control record to one of your 28 SOC2 IDs.
+    Try to normalize an Audit Manager control record to one of your SOC2 IDs.
 
     Strategy:
     - If ControlId already equals one of your SOC2 IDs (CC6.1, A1.3, etc.), use it.
     - Else look for any SOC2 ID substring in ControlName or ControlSetName.
-    - Fallback: return the raw ControlId (not ideal, but won’t break anything).
+    - Fallback: return the raw ControlId.
     """
     raw = (rec.get("ControlId") or "").strip()
     if raw in mapping:
         return raw
 
-    name_blob = " ".join([
-        rec.get("ControlName", "") or "",
-        rec.get("ControlSetName", "") or "",
-    ])
+    name_blob = " ".join(
+        [
+            rec.get("ControlName", "") or "",
+            rec.get("ControlSetName", "") or "",
+        ]
+    )
 
     for cid in mapping.keys():
         if cid in name_blob:
             return cid
 
-    return raw  # fallback – still lets index_to_pinecone run, but won’t map cleanly
+    return raw  # fallback – still indexable, but not mapped cleanly
+
+
+# -------------------------------------------------------------------
+# Core generator
+# -------------------------------------------------------------------
 
 class AuditReportGenerator:
-    """Generates comprehensive SOC 2 audit reports from AWS Audit Manager evidence."""
-    
+    """Generates weekly SOC 2 audit CSV reports from AWS Audit Manager evidence."""
+
     def __init__(self, region: str = "us-east-1"):
         self.region = region
         self.audit_manager = boto3.client("auditmanager", region_name=region)
@@ -92,94 +113,131 @@ class AuditReportGenerator:
         self.report_recipients = os.environ.get(
             "REPORT_RECIPIENTS", "auditor@example.com"
         ).split(",")
-        self.sender_email = os.environ.get(
-            "SENDER_EMAIL", "1stchoicecyber@gmail.com"
-        )
+        self.sender_email = os.environ.get("SENDER_EMAIL", "1stchoicecyber@gmail.com")
 
-    def fetch_assessment_evidence(self):
+    # ------------------------- Audit Manager ------------------------- #
+
+    def fetch_assessment_evidence(self) -> Dict[str, Any]:
         """Retrieve complete assessment structure from AWS Audit Manager."""
         try:
-            logger.info(f"Fetching assessment {self.assessment_id}")
+            logger.info("Fetching assessment %s", self.assessment_id)
             response = self.audit_manager.get_assessment(
                 assessmentId=self.assessment_id
             )
             assessment = response["assessment"]
-            logger.info(
-                "Retrieved assessment with %d control sets",
-                len(assessment["framework"]["controlSets"]),
-            )
+            control_sets = assessment["framework"]["controlSets"]
+            logger.info("Retrieved assessment with %d control sets", len(control_sets))
             return assessment
         except Exception as e:
-            logger.error(f"Error fetching assessment: {e}")
+            logger.error("Error fetching assessment: %s", e)
             raise
 
-    def collect_evidence_by_control(self, control_sets):
+    def collect_evidence_by_control(self, control_sets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Collect the latest evidence for each SOC 2 control."""
-        evidence_records = []
-        evidence_cutoff = datetime.utcnow() - timedelta(days=7)
+        evidence_records: List[Dict[str, Any]] = []
+        evidence_cutoff = datetime.utcnow().date() - timedelta(days=7)
 
         for cs in control_sets:
-            logger.info(f"Processing control set: {cs.get('name')}")
+            if not isinstance(cs, dict):
+                logger.warning("Unexpected control set type: %r", cs)
+                continue
+
+            cs_name = cs.get("name", "Unknown Control Set")
+            cs_id = cs.get("id")
+            logger.info("Processing control set: %s", cs_name)
+
             for control in cs.get("controls", []):
+                ctrl_id = control.get("id")
+                ctrl_name = control.get("name")
+
                 try:
                     folders = self.audit_manager.get_evidence_folders_by_assessment_control(
                         assessmentId=self.assessment_id,
-                        controlSetId=cs["id"],
-                        controlId=control["id"],
+                        controlSetId=cs_id,
+                        controlId=ctrl_id,
                     ).get("evidenceFolders", [])
 
                     if not folders:
                         evidence_records.append(
-                            self._create_placeholder_record(cs, control)
+                            self._create_placeholder_record(
+                                cs_name, ctrl_id, ctrl_name
+                            )
                         )
                         continue
 
-                    latest_evidence = []
+                    latest_evidence: List[Dict[str, Any]] = []
+
+                    # Prefer folders in the last 7 days
                     for folder in folders:
-                        if datetime.strptime(folder["date"], "%Y-%m-%d") >= evidence_cutoff.date():
-                            items = self._fetch_evidence_items(
-                                cs["id"], control["id"], folder["id"]
-                            )
+                        folder_date_str = folder.get("date")
+                        try:
+                            folder_date = datetime.strptime(
+                                folder_date_str, "%Y-%m-%d"
+                            ).date()
+                        except Exception:
+                            folder_date = evidence_cutoff  # treat as "old but usable"
+
+                        if folder_date >= evidence_cutoff:
+                            items = self._fetch_evidence_items(cs_id, ctrl_id, folder["id"])
                             latest_evidence.extend(
                                 self._process_evidence_items(
-                                    items, cs, control, folder
+                                    items, cs_name, ctrl_id, ctrl_name, folder
                                 )
                             )
 
-                    # If nothing recent, take most recent folder
+                    # If nothing recent, fall back to most recent folder overall
                     if not latest_evidence:
-                        latest_folder = max(folders, key=lambda x: x["date"])
-                        items = self._fetch_evidence_items(
-                            cs["id"], control["id"], latest_folder["id"]
-                        )
+                        latest_folder = max(folders, key=lambda x: x.get("date", ""))
+                        items = self._fetch_evidence_items(cs_id, ctrl_id, latest_folder["id"])
                         latest_evidence.extend(
                             self._process_evidence_items(
-                                items, cs, control, latest_folder
+                                items, cs_name, ctrl_id, ctrl_name, latest_folder
                             )
                         )
 
                     evidence_records.extend(latest_evidence)
 
                 except Exception as e:
-                    logger.warning(
-                        "Error processing control %s: %s", control["id"], e
-                    )
+                    logger.warning("Error processing control %s: %s", ctrl_id, e)
                     evidence_records.append(
-                        self._create_placeholder_record(cs, control, str(e))
+                        self._create_placeholder_record(
+                            cs_name, ctrl_id, ctrl_name, reason=str(e)
+                        )
                     )
 
         logger.info("Collected %d evidence records", len(evidence_records))
         return evidence_records
 
-    def _process_evidence_items(self, items, cs, control, folder):
-        processed = []
+    def _fetch_evidence_items(self, cs_id: str, ctrl_id: str, folder_id: str) -> List[Dict[str, Any]]:
+        try:
+            resp = self.audit_manager.get_evidence_by_evidence_folder(
+                assessmentId=self.assessment_id,
+                controlSetId=cs_id,
+                evidenceFolderId=folder_id,
+            )
+            return resp.get("evidence", []) or []
+        except Exception as e:
+            logger.warning("Error fetching evidence items: %s", e)
+            return []
+
+    def _process_evidence_items(
+        self,
+        items: List[Dict[str, Any]],
+        cs_name: str,
+        ctrl_id: str,
+        ctrl_name: str,
+        folder: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        processed: List[Dict[str, Any]] = []
+        folder_date = folder.get("date", "")
+
         for item in items:
             processed.append(
                 {
-                    "ControlSetName": cs.get("name"),
-                    "ControlId": control["id"],
-                    "ControlName": control.get("name"),
-                    "EvidenceDate": folder.get("date"),
+                    "ControlSetName": cs_name,
+                    "ControlId": ctrl_id,
+                    "ControlName": ctrl_name,
+                    "EvidenceDate": folder_date,
                     "EvidenceType": item.get("dataSource"),
                     "ComplianceStatus": self._determine_compliance_status(item),
                     "Finding": item.get("textResponse", ""),
@@ -189,22 +247,17 @@ class AuditReportGenerator:
             )
         return processed
 
-    def _fetch_evidence_items(self, cs_id, ctrl_id, folder_id):
-        try:
-            return self.audit_manager.get_evidence_by_evidence_folder(
-                assessmentId=self.assessment_id,
-                controlSetId=cs_id,
-                evidenceFolderId=folder_id,
-            ).get("evidence", [])
-        except Exception as e:
-            logger.warning(f"Error fetching evidence items: {e}")
-            return []
-
-    def _create_placeholder_record(self, cs, control, reason: str = "No evidence found"):
+    def _create_placeholder_record(
+        self,
+        cs_name: str,
+        ctrl_id: str,
+        ctrl_name: str,
+        reason: str = "No evidence found",
+    ) -> Dict[str, Any]:
         return {
-            "ControlSetName": cs.get("name"),
-            "ControlId": control["id"],
-            "ControlName": control.get("name"),
+            "ControlSetName": cs_name,
+            "ControlId": ctrl_id,
+            "ControlName": ctrl_name,
             "EvidenceDate": "No Evidence",
             "EvidenceType": "Manual Review Required",
             "ComplianceStatus": "UNKNOWN",
@@ -213,187 +266,114 @@ class AuditReportGenerator:
             "Severity": "LOW",
         }
 
-    def _determine_compliance_status(self, evidence):
+    def _determine_compliance_status(self, evidence: Dict[str, Any]) -> str:
         if "complianceCheck" in evidence:
             return evidence["complianceCheck"].get("status", "UNKNOWN").upper()
-        if "findingComplianceStatus" in evidence.get("attributes", {}):
-            return evidence["attributes"]["findingComplianceStatus"].upper()
+        attrs = evidence.get("attributes", {}) or {}
+        if "findingComplianceStatus" in attrs:
+            return attrs["findingComplianceStatus"].upper()
         return "UNKNOWN"
 
-    def _extract_resource_arn(self, evidence):
-        res = evidence.get("resourcesIncluded", [])
+    def _extract_resource_arn(self, evidence: Dict[str, Any]) -> str:
+        res = evidence.get("resourcesIncluded", []) or []
         return res[0].get("arn", "N/A") if res else "N/A"
 
-    def _extract_severity(self, evidence):
-        if "findingSeverity" in evidence.get("attributes", {}):
-            return evidence["attributes"]["findingSeverity"].upper()
-        return (
-            "MEDIUM"
-            if self._determine_compliance_status(evidence) == "FAILED"
-            else "LOW"
-        )
+    def _extract_severity(self, evidence: Dict[str, Any]) -> str:
+        attrs = evidence.get("attributes", {}) or {}
+        if "findingSeverity" in attrs:
+            return attrs["findingSeverity"].upper()
+        return "MEDIUM" if self._determine_compliance_status(evidence) == "FAILED" else "LOW"
 
-    def generate_excel_report(self, evidence_records):
-        df = pd.DataFrame(evidence_records)
-        if df.empty:
-            df = pd.DataFrame(
-                [self._create_placeholder_record({}, {"id": "N/A", "name": "N/A"})]
-            )
+    # -------------------------- CSV summary -------------------------- #
 
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
-            self._create_executive_summary_sheet(df, writer)
-            self._create_control_status_sheet(df, writer)
-            self._create_failed_findings_sheet(df, writer)
-            df.to_excel(writer, sheet_name="All Evidence Details", index=False)
-        excel_buffer.seek(0)
-        return excel_buffer
+    def generate_csv_summary_and_store(self, evidence_records: List[Dict[str, Any]]) -> str:
+        """
+        Write a slimmed-down CSV for RAG indexing.
 
-    def generate_csv_summary_and_store(self, evidence_records):
-            """
-            Write a slimmed-down CSV for RAG indexing.
+        Columns:
+        - framework, control_id, service, severity, summary, details, timestamp
 
-            Columns:
-            - framework, control_id, service, severity, summary, details, timestamp
-
-            Now normalized so:
-            - control_id matches your SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
-            - framework can be read from soc2_controls.csv if present (else defaults to SOC2)
-            """
-            if not evidence_records:
-                logger.warning("No evidence records – CSV summary will be empty placeholder.")
-                evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
-
-            # Load your 28-control mapping once
-            soc2_mapping = load_soc2_mapping()
-
-            csv_buffer = StringIO()
-            fieldnames = [
-                "framework",
-                "control_id",
-                "service",
-                "severity",
-                "summary",
-                "details",
-                "timestamp",
+        Normalization:
+        - control_id matches SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
+        - framework read from soc2_controls.csv when available (else defaults to SOC2)
+        """
+        if not evidence_records:
+            logger.warning("No evidence records – CSV summary will be empty placeholder.")
+            evidence_records = [
+                self._create_placeholder_record("N/A", "N/A", "N/A")
             ]
-            writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
-            writer.writeheader()
 
-            for rec in evidence_records:
-                # Derive normalized SOC2 control ID
-                soc2_id = infer_soc2_control_id(rec, soc2_mapping)
+        soc2_mapping = load_soc2_mapping()
 
-                # Derive service from ResourceArn if present
-                arn = rec.get("ResourceArn", "") or ""
-                if "s3" in arn:
-                    service = "S3"
-                elif "config" in arn:
-                    service = "Config"
-                elif "securityhub" in arn:
-                    service = "SecurityHub"
-                elif "lambda" in arn:
-                    service = "Lambda"
-                else:
-                    service = "Unknown"
+        csv_buffer = StringIO()
+        fieldnames = [
+            "framework",
+            "control_id",
+            "service",
+            "severity",
+            "summary",
+            "details",
+            "timestamp",
+        ]
+        writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+        writer.writeheader()
 
-                # Pull framework from mapping if available; default to SOC2
-                meta = soc2_mapping.get(soc2_id, {})
-                framework = meta.get("framework", "SOC2")
+        for rec in evidence_records:
+            soc2_id = infer_soc2_control_id(rec, soc2_mapping)
 
-                writer.writerow(
-                    {
-                        "framework": framework,
-                        "control_id": soc2_id,
-                        "service": service,
-                        "severity": rec.get("Severity", "LOW"),
-                        "summary": rec.get("Finding", ""),
-                        "details": f"{rec.get('ControlName','')} in {rec.get('ControlSetName','')} – {rec.get('EvidenceType','')}",
-                        "timestamp": rec.get("EvidenceDate", ""),
-                    }
-                )
+            arn = rec.get("ResourceArn", "") or ""
+            if "s3" in arn:
+                service = "S3"
+            elif "config" in arn:
+                service = "Config"
+            elif "securityhub" in arn:
+                service = "SecurityHub"
+            elif "lambda" in arn:
+                service = "Lambda"
+            else:
+                service = "Unknown"
 
-            csv_buffer.seek(0)
+            meta = soc2_mapping.get(soc2_id, {})
+            framework = meta.get("framework", "SOC2")
 
-            date_path = datetime.now().strftime("%Y/%m/%d")
-            filename = f"SOC2_Weekly_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-            s3_key = f"weekly/{date_path}/{filename}"
-
-            self.s3.put_object(
-                Bucket=self.s3_bucket,
-                Key=s3_key,
-                Body=csv_buffer.getvalue().encode("utf-8"),
-                ContentType="text/csv",
+            writer.writerow(
+                {
+                    "framework": framework,
+                    "control_id": soc2_id,
+                    "service": service,
+                    "severity": rec.get("Severity", "LOW"),
+                    "summary": rec.get("Finding", ""),
+                    "details": f"{rec.get('ControlName','')} in {rec.get('ControlSetName','')} – {rec.get('EvidenceType','')}",
+                    "timestamp": rec.get("EvidenceDate", ""),
+                }
             )
-            logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
-            return s3_key
 
-    def _create_executive_summary_sheet(self, df, writer):
-        total = df["ControlId"].nunique()
-        passed = df[df["ComplianceStatus"] == "PASSED"]["ControlId"].nunique()
-        failed = df[df["ComplianceStatus"] == "FAILED"]["ControlId"].nunique()
-        rate = (passed / total * 100) if total > 0 else 0
-        summary_df = pd.DataFrame(
-            {
-                "Metric": [
-                    "Total Controls",
-                    "Passing",
-                    "Failing",
-                    "Compliance Rate (%)",
-                    "Generated",
-                ],
-                "Value": [
-                    total,
-                    passed,
-                    failed,
-                    f"{rate:.1f}%",
-                    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                ],
-            }
-        )
-        summary_df.to_excel(
-            writer, sheet_name="Executive Summary", index=False
-        )
+        csv_buffer.seek(0)
 
-    def _create_control_status_sheet(self, df, writer):
-        status_df = (
-            df.groupby(["ControlSetName", "ControlId", "ControlName"])
-            .agg(
-                ComplianceStatus=("ComplianceStatus", "first"),
-                EvidenceDate=("EvidenceDate", "max"),
-            )
-            .reset_index()
-        )
-        status_df.to_excel(writer, sheet_name="Control Status", index=False)
-
-    def _create_failed_findings_sheet(self, df, writer):
-        failed_df = df[df["ComplianceStatus"].isin(["FAILED", "WARNING"])].copy()
-        if failed_df.empty:
-            failed_df = pd.DataFrame([{"Status": "No failed findings"}])
-        else:
-            sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-            failed_df["SevSort"] = failed_df["Severity"].map(sev_order)
-            failed_df = failed_df.sort_values("SevSort")
-        failed_df.to_excel(writer, sheet_name="Failed Findings", index=False)
-
-    def store_report_in_s3(self, excel_buffer):
-        date_path = datetime.now().strftime('%Y/%m/%d')
-        filename = f"SOC2_Weekly_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        date_path = datetime.utcnow().strftime("%Y/%m/%d")
+        filename = f"SOC2_Weekly_Summary_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
         s3_key = f"weekly/{date_path}/{filename}"
-        self.s3.put_object(Bucket=self.s3_bucket, Key=s3_key, Body=excel_buffer.getvalue())
-        logger.info(f"Stored report in S3: s3://{self.s3_bucket}/{s3_key}")
+
+        self.s3.put_object(
+            Bucket=self.s3_bucket,
+            Key=s3_key,
+            Body=csv_buffer.getvalue().encode("utf-8"),
+            ContentType="text/csv",
+        )
+        logger.info("Stored CSV summary in S3: s3://%s/%s", self.s3_bucket, s3_key)
         return s3_key
 
+    # ---------------------------- Email ------------------------------ #
 
-    def send_notification(self, s3_key):
+    def send_notification(self, s3_key: str) -> None:
         presigned_url = self.s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": self.s3_bucket, "Key": s3_key},
-            ExpiresIn=604800,
+            ExpiresIn=604800,  # 7 days
         )
-        subject = f"Weekly SOC 2 Audit Report - {datetime.now().strftime('%Y-%m-%d')}"
+        subject = f"Weekly SOC 2 Audit Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
         body = (
-            "The weekly SOC 2 compliance report is ready.\n\n"
+            "The weekly SOC 2 compliance CSV report is ready.\n\n"
             f"Download (expires in 7 days):\n{presigned_url}"
         )
         self.ses.send_email(
@@ -404,25 +384,26 @@ class AuditReportGenerator:
                 "Body": {"Text": {"Data": body}},
             },
         )
-        logger.info(
-            "Sent notifications to %d recipients", len(self.report_recipients)
-        )
+        logger.info("Sent notifications to %d recipients", len(self.report_recipients))
+
+
+# -------------------------------------------------------------------
+# Lambda entry point
+# -------------------------------------------------------------------
 
 def lambda_handler(event, context):
     generator = AuditReportGenerator(region=os.environ.get("AWS_REGION", "us-east-1"))
+
     assessment = generator.fetch_assessment_evidence()
-    evidence_records = generator.collect_evidence_by_control(assessment)
+    control_sets = assessment["framework"]["controlSets"]
+    evidence_records = generator.collect_evidence_by_control(control_sets)
 
-    excel_buffer = generator.generate_excel_report(evidence_records)
-    s3_excel_key = generator.store_report_in_s3(excel_buffer)
-
+    # CSV-only report (no pandas/xlsxwriter/Excel)
     csv_key = generator.generate_csv_summary_and_store(evidence_records)
 
-    generator.send_notification(s3_excel_key)
-    logger.info(f"Weekly Lambda completed. Excel: {s3_excel_key}, CSV: {csv_key}")
+    generator.send_notification(csv_key)
+    logger.info("Weekly Lambda completed. CSV: %s", csv_key)
     return {
-        "excel_report_key": s3_excel_key,
         "csv_summary_key": csv_key,
         "record_count": len(evidence_records),
     }
-

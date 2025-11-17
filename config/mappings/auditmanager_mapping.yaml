@@ -1,0 +1,34 @@
+# config/mappings/auditmanager_mapping.yaml
+# Maps Audit Manager control IDs to your canonical SOC2 + ISO mapping.
+# Expand this with the rest of your 28 controls when you’re ready.
+
+controls:
+  "CC6.1":
+    soc2_control_id: "CC6.1"
+    tsc_domain: "Security (CC)"
+    area: "Logical Access"
+    iso_control_id: "A.9.2.3"
+
+  "CC6.3":
+    soc2_control_id: "CC6.3"
+    tsc_domain: "Security (CC)"
+    area: "Logical Access"
+    iso_control_id: "A.9.4.2"
+
+  "CC7.2":
+    soc2_control_id: "CC7.2"
+    tsc_domain: "Security (CC)"
+    area: "Change Management"
+    iso_control_id: "A.12.1.3"
+
+  "A1.3":
+    soc2_control_id: "A1.3"
+    tsc_domain: "Availability (A)"
+    area: "Availability"
+    iso_control_id: "A.12.1.3"
+
+  "C1.1":
+    soc2_control_id: "C1.1"
+    tsc_domain: "Confidentiality (C)"
+    area: "Confidentiality"
+    iso_control_id: "A.8.2.3"
