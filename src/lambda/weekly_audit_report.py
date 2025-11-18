@@ -364,18 +364,167 @@ class AuditReportGenerator:
         return s3_key
 
     # ---------------------------- Email ------------------------------ #
+    
+    def compute_summary_metrics(self, evidence_records):
+        """
+        Compute simple executive-level metrics from the evidence records.
+        Returns a dict with totals and a short text summary.
+        """
+        if not evidence_records:
+            return {
+                "total_controls": 0,
+                "passed_controls": 0,
+                "failed_controls": 0,
+                "unknown_controls": 0,
+                "summary_text": "No evidence records were collected for this run.",
+            }
 
-    def send_notification(self, s3_key: str) -> None:
+        # Unique controls overall
+        all_controls = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
+        total_controls = len(all_controls)
+
+        # Controls by status (using first status we see per control)
+        status_by_control = {}
+        for rec in evidence_records:
+            cid = rec.get("ControlId")
+            status = (rec.get("ComplianceStatus") or "UNKNOWN").upper()
+            if not cid:
+                continue
+            # Only set once – first status wins
+            status_by_control.setdefault(cid, status)
+
+        passed_controls = {c for c, s in status_by_control.items() if s == "PASSED"}
+        failed_controls = {c for c, s in status_by_control.items() if s == "FAILED"}
+        unknown_controls = {c for c, s in status_by_control.items() if s not in ("PASSED", "FAILED")}
+
+        compliance_rate = 0.0
+        if total_controls > 0:
+            compliance_rate = (len(passed_controls) / total_controls) * 100.0
+
+        # Build a short, human-readable summary string
+        summary_lines = [
+            f"Total controls evaluated: {total_controls}",
+            f"Passing controls: {len(passed_controls)}",
+            f"Failing controls: {len(failed_controls)}",
+            f"Unknown / manual review: {len(unknown_controls)}",
+            f"Overall compliance rate: {compliance_rate:.1f}%",
+        ]
+
+        # Optionally call out up to 5 failing controls
+        if failed_controls:
+            top_failed = sorted(list(failed_controls))[:5]
+            summary_lines.append("")
+            summary_lines.append("Sample failing controls (up to 5):")
+            for cid in top_failed:
+                summary_lines.append(f"- {cid}")
+
+        return {
+            "total_controls": total_controls,
+            "passed_controls": len(passed_controls),
+            "failed_controls": len(failed_controls),
+            "unknown_controls": len(unknown_controls),
+            "compliance_rate": compliance_rate,
+            "summary_text": "\n".join(summary_lines),
+        }
+  
+    def build_summary(self, evidence_records):
+        """
+        Build a simple executive summary from evidence records.
+        """
+        # Unique controls (by ControlId)
+        control_ids = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
+        total_controls = len(control_ids)
+
+        passing_ids = {
+            rec.get("ControlId")
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "PASSED"
+        }
+        failing_ids = {
+            rec.get("ControlId")
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "FAILED"
+        }
+
+        passed_controls = len(passing_ids)
+        failed_controls = len(failing_ids)
+        unknown_controls = max(total_controls - passed_controls - failed_controls, 0)
+
+        compliance_rate = (passed_controls / total_controls * 100.0) if total_controls else 0.0
+
+        # Rough “risk” counters – you can tweak this later
+        critical_high = sum(
+            1
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "FAILED"
+            and rec.get("Severity", "").upper() in ("CRITICAL", "HIGH")
+        )
+        medium = sum(
+            1
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "FAILED"
+            and rec.get("Severity", "").upper() == "MEDIUM"
+        )
+
+        return {
+            "total_controls": total_controls,
+            "passed_controls": passed_controls,
+            "failed_controls": failed_controls,
+            "unknown_controls": unknown_controls,
+            "compliance_rate": compliance_rate,
+            "critical_high": critical_high,
+            "medium": medium,
+        }
+
+    def send_notification(self, s3_key, summary):
+        """
+        Send an executive-style email summary + CSV download link.
+
+        `summary` is the dict returned by build_summary().
+        """
+        # Generate presigned URL to the CSV summary
         presigned_url = self.s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": self.s3_bucket, "Key": s3_key},
             ExpiresIn=604800,  # 7 days
         )
-        subject = f"Weekly SOC 2 Audit Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
-        body = (
-            "The weekly SOC 2 compliance CSV report is ready.\n\n"
-            f"Download (expires in 7 days):\n{presigned_url}"
-        )
+
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        subject = f"Weekly SOC 2 Audit Summary – {today}"
+
+        body = f"""Weekly SOC 2 Audit Summary – {today}
+
+    # Weekly SOC 2 Audit Summary
+
+    ## Executive Summary
+
+    Your weekly SOC 2 compliance snapshot is ready.
+
+    - Total controls evaluated: {summary['total_controls']}
+    - Passing controls: {summary['passed_controls']}
+    - Failing controls: {summary['failed_controls']}
+    - Unknown / manual review: {summary['unknown_controls']}
+    - Overall compliance rate: {summary['compliance_rate']:.1f}%
+
+    ## Key Recommendations
+
+    1. **High Priority:** Review and address all controls with FAILED status and Critical/High severity (currently: {summary['critical_high']} findings).
+    2. **Medium Priority:** Work through remaining FAILED controls with Medium severity (currently: {summary['medium']} findings), prioritising those tied to production accounts.
+    3. **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager evidence. Re-run this report after major changes or incidents.
+
+    ## Next Steps
+
+    - Download the full CSV evidence summary for detailed, control-by-control review:
+    {presigned_url}
+
+    For each failing control, confirm ownership, create remediation tickets, and track progress in your GRC backlog.
+
+    ---
+
+    This report was generated automatically by the FAFO Continuous Compliance engine.
+    """
+
         self.ses.send_email(
             Source=self.sender_email,
             Destination={"ToAddresses": self.report_recipients},
@@ -384,7 +533,11 @@ class AuditReportGenerator:
                 "Body": {"Text": {"Data": body}},
             },
         )
-        logger.info("Sent notifications to %d recipients", len(self.report_recipients))
+        logger.info(
+            "Sent notifications to %d recipients", len(self.report_recipients)
+        )
+
+
 
 
 # -------------------------------------------------------------------
@@ -398,18 +551,20 @@ def lambda_handler(event, context):
     control_sets = assessment["framework"]["controlSets"]
     evidence_records = generator.collect_evidence_by_control(control_sets)
 
+    # Build executive summary stats
+    summary = generator.build_summary(evidence_records)
+
     # CSV-only report (no pandas/xlsxwriter/Excel)
     csv_key = generator.generate_csv_summary_and_store(evidence_records)
 
-# Don’t let SES failures break the function
-    try:
-        generator.send_notification(csv_key)
-    except Exception as e:
-        logger.warning(f"SES notification failed: {e}")
-
+    # Send nicely formatted executive summary email + link
+    generator.send_notification(csv_key, summary)
     logger.info(f"Weekly Lambda completed. CSV: {csv_key}")
     return {
         "csv_summary_key": csv_key,
         "record_count": len(evidence_records),
+        "summary": summary,
     }
+
+
 
