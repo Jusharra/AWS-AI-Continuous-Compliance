@@ -21,8 +21,9 @@ from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Any
-
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
 
 # -------------------------------------------------------------------
 # Paths & logging
@@ -114,6 +115,18 @@ class AuditReportGenerator:
             "REPORT_RECIPIENTS", "qjgoree@gmail.com"
         ).split(",")
         self.sender_email = os.environ.get("SENDER_EMAIL", "1stchoicecyber@gmail.com")
+
+        # -------------------------------------------------------
+        #  NEW: Bedrock client for AI-written recommendations
+        # -------------------------------------------------------
+        self.bedrock = boto3.client("bedrock-runtime", region_name=region)
+
+        # Model can be overridden via ENV, otherwise Claude Sonnet
+        self.bedrock_model_id = os.environ.get(
+            "BEDROCK_CLAUDE_MODEL_ID",
+            "anthropic.claude-3-sonnet-20240229-v1:0"
+        )
+
 
     # ------------------------- Audit Manager ------------------------- #
 
@@ -475,6 +488,79 @@ class AuditReportGenerator:
             "critical_high": critical_high,
             "medium": medium,
         }
+    def build_ai_recommendations(self, summary: dict) -> str:
+        """
+        Use Claude via Bedrock to generate short, exec-level key recommendations.
+
+        Returns markdown bullet points. Falls back to static text if Bedrock fails.
+        """
+        prompt = f"""
+You are a senior cloud security and GRC engineer.
+
+You are writing the **Key Recommendations** section of a weekly SOC 2 audit email
+for a CISO and audit team. You are given the weekly compliance snapshot:
+
+- Total controls evaluated: {summary['total_controls']}
+- Passing controls: {summary['passed_controls']}
+- Failing controls: {summary['failed_controls']}
+- Unknown / manual review: {summary['unknown_controls']}
+- Overall compliance rate: {summary['compliance_rate']:.1f}%
+- Failed findings with Critical/High severity: {summary['critical_high']}
+- Failed findings with Medium severity: {summary['medium']}
+
+Write 3–5 short bullet points grouped by priority:
+
+- High Priority
+- Medium Priority
+- Ongoing
+
+Each bullet should be 1–2 sentences, focused on **what to do next week**
+(remediation, owners, and monitoring). Do NOT restate the raw numbers, and do NOT
+mention that an AI wrote this. Keep it under 150 words total.
+
+Return ONLY markdown bullet points (no headings, no intro, no outro).
+"""
+
+        try:
+            body = json.dumps(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": prompt}],
+                        }
+                    ],
+                    "max_tokens": 300,
+                    "temperature": 0.2,
+                }
+            )
+
+            resp = self.bedrock.invoke_model(
+                modelId=self.bedrock_model_id,
+                body=body,
+            )
+            resp_body = json.loads(resp["body"].read())
+            # Anthropic-style response
+            content = resp_body["output"]["message"]["content"]
+            text_parts = [c["text"] for c in content if c.get("type") == "text"]
+            text = "\n".join(text_parts).strip()
+
+            if not text:
+                raise ValueError("Empty Bedrock response")
+
+            return text
+
+        except (BotoCoreError, ClientError, KeyError, ValueError, Exception) as e:
+            logger.warning(f"Bedrock recommendations failed, using static text. Error: {e}")
+            # Fallback: static bullets (very similar to what you had)
+            return (
+                "- **High Priority:** Review and address all FAILED controls with Critical/High severity. "
+                "Confirm ownership and open remediation tickets in your GRC backlog.\n"
+                "- **Medium Priority:** Work through remaining FAILED controls with Medium severity, "
+                "focusing on production accounts and internet-exposed resources.\n"
+                "- **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager. "
+                "Re-run this report after major changes or incidents."
+            )
 
     def send_notification(self, s3_key, summary):
         """
@@ -490,40 +576,41 @@ class AuditReportGenerator:
         )
 
         today = datetime.now().strftime("%Y-%m-%d")
-
         subject = f"Weekly SOC 2 Audit Summary – {today}"
+
+        # Ask Claude (via Bedrock) for Key Recommendations
+        ai_recommendations = self.build_ai_recommendations(summary)
 
         body = f"""Weekly SOC 2 Audit Summary – {today}
 
-    # Weekly SOC 2 Audit Summary
+# Weekly SOC 2 Audit Summary
 
-    ## Executive Summary
+## Executive Summary
 
-    Your weekly SOC 2 compliance snapshot is ready.
+Your weekly SOC 2 compliance snapshot is ready.
 
-    - Total controls evaluated: {summary['total_controls']}
-    - Passing controls: {summary['passed_controls']}
-    - Failing controls: {summary['failed_controls']}
-    - Unknown / manual review: {summary['unknown_controls']}
-    - Overall compliance rate: {summary['compliance_rate']:.1f}%
+- Total controls evaluated: {summary['total_controls']}
+- Passing controls: {summary['passed_controls']}
+- Failing controls: {summary['failed_controls']}
+- Unknown / manual review: {summary['unknown_controls']}
+- Overall compliance rate: {summary['compliance_rate']:.1f}%
 
-    ## Key Recommendations
+## Key Recommendations
 
-    1. **High Priority:** Review and address all controls with FAILED status and Critical/High severity (currently: {summary['critical_high']} findings).
-    2. **Medium Priority:** Work through remaining FAILED controls with Medium severity (currently: {summary['medium']} findings), prioritising those tied to production accounts.
-    3. **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager evidence. Re-run this report after major changes or incidents.
+{ai_recommendations}
 
-    ## Next Steps
+## Next Steps
 
-    - Download the full CSV evidence summary for detailed, control-by-control review:
-    {presigned_url}
+- Download the full CSV evidence summary for detailed, control-by-control review:
+  {presigned_url}
 
-    For each failing control, confirm ownership, create remediation tickets, and track progress in your GRC backlog.
+For each failing control, confirm ownership, create remediation tickets,
+and track progress in your GRC backlog.
 
-    ---
+---
 
-    This report was generated automatically by the FAFO Continuous Compliance engine.
-    """
+This report was generated automatically by the FAFO Continuous Compliance engine.
+"""
 
         self.ses.send_email(
             Source=self.sender_email,
@@ -536,6 +623,7 @@ class AuditReportGenerator:
         logger.info(
             "Sent notifications to %d recipients", len(self.report_recipients)
         )
+
 
 
 
