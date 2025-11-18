@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from collections import Counter
 
 
 # -------------------------------------------------------------------
@@ -561,6 +562,109 @@ Return ONLY markdown bullet points (no headings, no intro, no outro).
                 "- **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager. "
                 "Re-run this report after major changes or incidents."
             )
+    def _compute_summary_metrics(self, evidence_records):
+        """Compute simple exec-summary stats from the evidence list."""
+        # Unique controls by ID
+        control_ids = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
+        total_controls = len(control_ids)
+
+        passed_controls = {
+            rec.get("ControlId")
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "PASSED"
+        }
+        failed_controls = {
+            rec.get("ControlId")
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "FAILED"
+        }
+
+        passing = len(passed_controls)
+        failing = len(failed_controls)
+        unknown = max(total_controls - passing - failing, 0)
+
+        # Severity breakdown for failed findings
+        failed_severities = Counter(
+            (rec.get("Severity", "LOW") or "LOW").upper()
+            for rec in evidence_records
+            if rec.get("ComplianceStatus") == "FAILED"
+        )
+
+        compliance_rate = (passing / total_controls * 100.0) if total_controls > 0 else 0.0
+
+        return {
+            "total_controls": total_controls,
+            "passing": passing,
+            "failing": failing,
+            "unknown": unknown,
+            "compliance_rate": compliance_rate,
+            "failed_severities": failed_severities,
+        }
+
+    def _build_email_body(self, evidence_records, presigned_url: str) -> str:
+        """
+        Build an AWS-Access-Review-style email body:
+        - Title
+        - Executive Summary
+        - Key Recommendations
+        - Next Steps
+        """
+        metrics = self._compute_summary_metrics(evidence_records)
+
+        total = metrics["total_controls"]
+        passing = metrics["passing"]
+        failing = metrics["failing"]
+        unknown = metrics["unknown"]
+        rate = metrics["compliance_rate"]
+        failed_severities = metrics["failed_severities"]
+
+        crit = failed_severities.get("CRITICAL", 0)
+        high = failed_severities.get("HIGH", 0)
+        medium = failed_severities.get("MEDIUM", 0)
+        low = failed_severities.get("LOW", 0)
+
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+        body = f"""AWS Access Review Report
+
+# AWS Access Review Report
+
+## Executive Summary
+
+This automated weekly report summarizes the current SOC 2 control posture for your AWS environment as of {today_str}.
+
+- Total controls evaluated: {total}
+- Passing controls: {passing}
+- Failing controls: {failing}
+- Unknown / manual review: {unknown}
+- Overall compliance rate: {rate:.1f}%
+
+Failed findings by severity:
+- Critical: {crit}
+- High: {high}
+- Medium: {medium}
+- Low: {low}
+
+## Key Recommendations
+
+1. **High Priority:** Review all controls with Critical or High severity failed findings and create remediation tasks for each.
+2. **Medium Priority:** Address Medium severity findings as part of your regular sprint or weekly maintenance cycle.
+3. **Low Priority:** Track Low severity issues for long-term hardening and defense-in-depth improvements.
+4. **Ongoing:** Maintain regular evidence collection, report reviews, and configuration monitoring to prevent control drift.
+
+## Next Steps
+
+For detailed findings and specific recommendations, please review the attached CSV report or download it using the link below:
+
+{presigned_url}
+
+If this report was generated as part of a demo environment, replace the recipient list with your production security and GRC contacts.
+
+---
+This report was generated automatically by the FAFO Continuous Compliance engine.
+"""
+
+        return body
 
     def send_notification(self, s3_key, summary):
         """
@@ -647,12 +751,13 @@ def lambda_handler(event, context):
 
     # Send nicely formatted executive summary email + link
     generator.send_notification(csv_key, summary)
+
     logger.info(f"Weekly Lambda completed. CSV: {csv_key}")
     return {
         "csv_summary_key": csv_key,
         "record_count": len(evidence_records),
-        "summary": summary,
     }
+
 
 
 
