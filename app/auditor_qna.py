@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from pinecone import Pinecone, Index
 from anthropic import Anthropic
 import re
+from botocore.config import Config
+
 #from pinecone_text.sparse import BM25Encoder
 
 #bm25 = BM25Encoder().default()
@@ -52,7 +54,12 @@ index: Index = pc.Index(PINECONE_INDEX_NAME)
 anthropic_client = Anthropic(api_key=anthropic_key)
 
 S3_EVIDENCE_BUCKET = os.environ.get("FAFO_EVIDENCE_BUCKET", "")
-s3_client = boto3.client("s3", region_name=AWS_REGION)
+s3_client = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+    config=Config(signature_version="s3v4"),
+)
+
 # -----------------------------
 # Embeddings (Bedrock Titan)
 # -----------------------------
@@ -252,7 +259,7 @@ def main():
     st.subheader("Generate fresh weekly report")
 
     if st.button("Run weekly Audit Manager export"):
-        with st.spinner("Invoking weekly_audit_report Lambda..."):
+        with st.spinner("Invoking fafo-weekly-audit-report Lambda..."):
             try:
                 resp = lambda_client.invoke(
                     FunctionName=WEEKLY_LAMBDA_NAME,
@@ -261,41 +268,34 @@ def main():
                 payload_raw = resp.get("Payload")
                 payload = json.loads(payload_raw.read()) if payload_raw else {}
 
-                st.write("Lambda payload:", payload)
+                # Show raw payload for transparency / debugging
+                st.markdown("**Lambda payload:**")
+                st.json(payload)
 
-                excel_key = payload.get("excel_report_key")
                 csv_key = payload.get("csv_summary_key")
-
-                msg_lines = []
-                if excel_key:
-                    msg_lines.append(f"Excel report: `s3://{os.environ.get('FAFO_EVIDENCE_BUCKET', '')}/{excel_key}`")
-                if csv_key:
-                    msg_lines.append(f"CSV summary: `s3://{os.environ.get('FAFO_EVIDENCE_BUCKET', '')}/{csv_key}`")
-
-                if excel_key:
-                    try:
-                        excel_url = s3_client.generate_presigned_url(
-                            "get_object",
-                            Params={"Bucket": S3_EVIDENCE_BUCKET, "Key": excel_key},
-                            ExpiresIn=3600,
-                        )
-                        st.markdown(f"[Download Excel report 📊]({excel_url})")
-                    except Exception as e:
-                        st.warning(f"Could not generate Excel download link: {e}")
+                record_count = payload.get("record_count")
 
                 if csv_key:
                     try:
                         csv_url = s3_client.generate_presigned_url(
                             "get_object",
                             Params={"Bucket": S3_EVIDENCE_BUCKET, "Key": csv_key},
-                            ExpiresIn=3600,
+                            ExpiresIn=3600,  # 1 hour
                         )
                         st.markdown(f"[Download CSV summary 🧾]({csv_url})")
+                        if record_count is not None:
+                            st.caption(f"Rows in CSV: {record_count}")
                     except Exception as e:
                         st.warning(f"Could not generate CSV download link: {e}")
+                else:
+                    st.warning(
+                        "Lambda completed but did not return `csv_summary_key`. "
+                        "Check CloudWatch logs for fafo-weekly-audit-report."
+                    )
 
             except Exception as e:
                 st.error(f"Error invoking weekly report Lambda: {e}")
+
 
     if st.button("Run Query", type="primary"):
         if not query.strip():

@@ -145,64 +145,82 @@ def fetch_object_text(key: str) -> str:
 # -----------------------------
 # Weekly CSV → Chunks
 # -----------------------------
-def build_chunks_from_weekly_csv(key: str, mapping: Dict[str, Dict]) -> List[Tuple[str, str, Dict]]:
+def build_chunks_from_weekly_csv(
+    key: str,
+    mapping: Dict[str, Dict],
+) -> List[Tuple[str, str, Dict]]:
+    """
+    Build Pinecone chunks from the weekly SOC2_Weekly_Summary_*.csv file.
+
+    CSV columns we expect (from generate_csv_summary_and_store):
+      - framework
+      - control_id
+      - service
+      - severity
+      - summary
+      - details
+      - timestamp
+    """
+    import io
+    import csv
+
     s3_uri = f"s3://{EVIDENCE_BUCKET}/{key}"
-    text = fetch_object_text(key)
-    rows = list(csv.DictReader(text.splitlines()))
+    raw = fetch_object_text(key)
+
+    if not raw.strip():
+        print(f"[WARN] Weekly CSV {key} is empty.")
+        return []
+
+    reader = csv.DictReader(io.StringIO(raw))
     chunks: List[Tuple[str, str, Dict]] = []
 
-    for i, row in enumerate(rows):
-        control_id = row.get("control_id", "").strip() or row.get("ControlId", "").strip()
-        mapped = mapping.get(control_id, {})
+    for idx, row in enumerate(reader):
+        control_id = (row.get("control_id") or "").strip()
+        framework = (row.get("framework") or "SOC2").strip() or "SOC2"
+        service = (row.get("service") or "Unknown").strip() or "Unknown"
+        severity = (row.get("severity") or "LOW").upper()
+        summary = (row.get("summary") or "").strip()
+        details = (row.get("details") or "").strip()
+        timestamp = (row.get("timestamp") or "").strip()
 
-        framework = mapped.get("framework", "SOC2") or "SOC2"
-        tsc_domain = mapped.get("tsc_domain", "")
+        # Look up extra metadata from soc2_controls.csv, if we have a match
+        mapped = mapping.get(control_id, {}) if control_id else {}
         area = mapped.get("area", "")
+        tsc_domain = mapped.get("tsc_domain", "")
         iso_control_id = mapped.get("iso_control_id", "")
-        aws_mechanism_type = mapped.get("aws_mechanism_type", "")
-        aws_mechanism = mapped.get("aws_mechanism", "")
 
-        service = row.get("service", mapped.get("aws_mechanism_type", "Unknown"))
-        severity = row.get("severity", "Info")
-        ts = row.get("timestamp", "")
-
+        # Text that the LLM will actually see
         body = (
+            f"Weekly SOC 2 evidence summary for control {control_id or 'Unknown'} ({area}).\n"
             f"Framework: {framework}\n"
-            f"SOC2 Control: {control_id}\n"
-            f"TSC Domain: {tsc_domain}\n"
-            f"Area: {area}\n"
-            f"ISO Control: {iso_control_id}\n"
-            f"AWS Mechanism Type: {aws_mechanism_type}\n"
-            f"AWS Mechanism: {aws_mechanism}\n"
             f"Service: {service}\n"
             f"Severity: {severity}\n"
-            f"Summary: {row.get('summary','')}\n"
-            f"Details: {row.get('details','')}\n"
-            f"Evidence: {s3_uri}\n"
-            f"Timestamp: {ts}"
+            f"Summary: {summary}\n"
+            f"Details: {details}\n"
+            f"S3 CSV source: {s3_uri}\n"
+            f"Timestamp: {timestamp}"
         )
 
+        doc_id = f"{key}::{control_id or 'UNKNOWN'}::{idx}"
+
         metadata = {
-            "framework": framework,            # SOC2
-            "control_id": control_id,          # CC6.3, CC7.2, A1.4, etc
-            "tsc_domain": tsc_domain,          # Security (CC), Availability (A), Confidentiality (C)
-            "area": area,                      # Logical Access / Change Management / System Operations / Availability / Confidentiality
-            "iso_control_id": iso_control_id,  # A.9.2.3, A.12.1.3, ...
-            "aws_mechanism_type": aws_mechanism_type,
-            "aws_mechanism": aws_mechanism,
+            "framework": framework,
+            "control_id": control_id or "UNKNOWN",
+            "tsc_domain": tsc_domain,
+            "area": area,
+            "iso_control_id": iso_control_id,
             "service": service,
             "severity": severity,
             "s3_uri": s3_uri,
-            "source": "weekly_report",
-            "timestamp": ts,
-            "line": i,
+            "timestamp": timestamp,
+            "source": "weekly_summary",
             "text": body,
         }
-        doc_id = f"{key}#row-{i}"
+
         chunks.append((doc_id, body, metadata))
 
+    print(f"[INFO] Built {len(chunks)} chunks from weekly CSV {key}")
     return chunks
-
 
 # -----------------------------
 # Remediation JSON → Chunks

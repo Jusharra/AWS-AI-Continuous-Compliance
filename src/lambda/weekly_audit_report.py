@@ -17,14 +17,23 @@ import csv
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from collections import Counter
+from botocore.config import Config
 
+
+
+
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+BEDROCK_CLAUDE_MODEL_ID = os.environ.get(
+    "BEDROCK_CLAUDE_MODEL_ID",
+    "claude-sonnet-4-5-20250929",  # Claude 3 Sonnet on Bedrock
+)
 
 # -------------------------------------------------------------------
 # Paths & logging
@@ -104,8 +113,13 @@ class AuditReportGenerator:
     def __init__(self, region: str = "us-east-1"):
         self.region = region
         self.audit_manager = boto3.client("auditmanager", region_name=region)
-        self.s3 = boto3.client("s3", region_name=region)
+        self.s3 = boto3.client(
+            "s3",
+            region_name=region,
+            config=Config(signature_version="s3v4"),
+        )
         self.ses = boto3.client("ses", region_name=region)
+        self.bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
         # Configuration - pulled from environment variables
         self.assessment_id = os.environ.get(
@@ -146,76 +160,83 @@ class AuditReportGenerator:
             logger.error("Error fetching assessment: %s", e)
             raise
 
-    def collect_evidence_by_control(self, control_sets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def collect_evidence_by_control(self, control_sets):
         """Collect the latest evidence for each SOC 2 control."""
-        evidence_records: List[Dict[str, Any]] = []
-        evidence_cutoff = datetime.utcnow().date() - timedelta(days=7)
+        evidence_records = []
+        evidence_cutoff = datetime.utcnow() - timedelta(days=7)
 
         for cs in control_sets:
-            if not isinstance(cs, dict):
-                logger.warning("Unexpected control set type: %r", cs)
-                continue
-
-            cs_name = cs.get("name", "Unknown Control Set")
+            cs_name = cs.get("name", "Unknown control set")
             cs_id = cs.get("id")
-            logger.info("Processing control set: %s", cs_name)
+            logger.info(f"Processing control set: {cs_name}")
 
             for control in cs.get("controls", []):
                 ctrl_id = control.get("id")
-                ctrl_name = control.get("name")
+                ctrl_name = control.get("name", "Unknown control")
 
                 try:
-                    folders = self.audit_manager.get_evidence_folders_by_assessment_control(
+                    resp = self.audit_manager.get_evidence_folders_by_assessment_control(
                         assessmentId=self.assessment_id,
                         controlSetId=cs_id,
                         controlId=ctrl_id,
-                    ).get("evidenceFolders", [])
+                    )
+                    folders = resp.get("evidenceFolders", []) or []
 
+                    # No folders at all → placeholder
                     if not folders:
                         evidence_records.append(
                             self._create_placeholder_record(
-                                cs_name, ctrl_id, ctrl_name
+                                cs_name, ctrl_id, ctrl_name, "No evidence folders found"
                             )
                         )
                         continue
 
-                    latest_evidence: List[Dict[str, Any]] = []
+                    latest_evidence: list[dict] = []
 
-                    # Prefer folders in the last 7 days
+                    # Prefer folders with “recent” dates (last 7 days)
                     for folder in folders:
-                        folder_date_str = folder.get("date")
-                        try:
-                            folder_date = datetime.strptime(
-                                folder_date_str, "%Y-%m-%d"
-                            ).date()
-                        except Exception:
-                            folder_date = evidence_cutoff  # treat as "old but usable"
+                        raw_date = folder.get("date")
+                        folder_date = self._parse_folder_date(raw_date)
 
-                        if folder_date >= evidence_cutoff:
-                            items = self._fetch_evidence_items(cs_id, ctrl_id, folder["id"])
+                        if (
+                            folder_date is not None
+                            and folder_date >= evidence_cutoff.date()
+                        ):
+                            items = self._fetch_evidence_items(
+                                cs_id, ctrl_id, folder.get("id")
+                            )
                             latest_evidence.extend(
-                                self._process_evidence_items(
-                                    items, cs_name, ctrl_id, ctrl_name, folder
-                                )
+                                self._process_evidence_items(items, cs, control, folder)
                             )
 
-                    # If nothing recent, fall back to most recent folder overall
+                    # If nothing recent, fall back to the most recent folder by date
                     if not latest_evidence:
-                        latest_folder = max(folders, key=lambda x: x.get("date", ""))
-                        items = self._fetch_evidence_items(cs_id, ctrl_id, latest_folder["id"])
+                        latest_folder = max(
+                            folders,
+                            key=lambda f: self._parse_folder_date(f.get("date"))
+                            or datetime.min.date(),
+                        )
+                        items = self._fetch_evidence_items(
+                            cs_id, ctrl_id, latest_folder.get("id")
+                        )
                         latest_evidence.extend(
                             self._process_evidence_items(
-                                items, cs_name, ctrl_id, ctrl_name, latest_folder
+                                items, cs, control, latest_folder
                             )
                         )
 
                     evidence_records.extend(latest_evidence)
 
                 except Exception as e:
-                    logger.warning("Error processing control %s: %s", ctrl_id, e)
+                    logger.warning(
+                        "Error processing control %s (%s): %s", ctrl_id, ctrl_name, e
+                    )
                     evidence_records.append(
                         self._create_placeholder_record(
-                            cs_name, ctrl_id, ctrl_name, reason=str(e)
+                            cs_name,
+                            ctrl_id,
+                            ctrl_name,
+                            f"Error collecting evidence: {e}",
                         )
                     )
 
@@ -234,40 +255,70 @@ class AuditReportGenerator:
             logger.warning("Error fetching evidence items: %s", e)
             return []
 
-    def _process_evidence_items(
-        self,
-        items: List[Dict[str, Any]],
-        cs_name: str,
-        ctrl_id: str,
-        ctrl_name: str,
-        folder: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        processed: List[Dict[str, Any]] = []
-        folder_date = folder.get("date", "")
+    def _process_evidence_items(self, items, cs, control, folder):
+        """Normalize raw Audit Manager evidence items into our flat record shape."""
+        processed = []
+        cs_name = cs.get("name", "Unknown control set")
+        ctrl_id = control.get("id")
+        ctrl_name = control.get("name", "Unknown control")
 
-        for item in items:
+        folder_date = self._parse_folder_date(folder.get("date"))
+        folder_date_str = (
+            folder_date.isoformat() if isinstance(folder_date, datetime) else str(folder_date)
+            if folder_date is not None
+            else "No Evidence"
+        )
+
+        for item in items or []:
             processed.append(
                 {
                     "ControlSetName": cs_name,
                     "ControlId": ctrl_id,
                     "ControlName": ctrl_name,
-                    "EvidenceDate": folder_date,
+                    "EvidenceDate": folder_date_str,
                     "EvidenceType": item.get("dataSource"),
                     "ComplianceStatus": self._determine_compliance_status(item),
-                    "Finding": item.get("textResponse", ""),
+                    "Finding": item.get("textResponse", "")
+                    or item.get("notes", "")
+                    or "No evidence text available",
                     "ResourceArn": self._extract_resource_arn(item),
                     "Severity": self._extract_severity(item),
                 }
             )
         return processed
+    def _parse_folder_date(self, raw_date):
+        """Safely parse Audit Manager folder date which may be string or datetime."""
+        if raw_date is None:
+            return None
+
+        if isinstance(raw_date, datetime):
+            return raw_date
+
+        if isinstance(raw_date, str):
+            try:
+                # Audit Manager usually uses YYYY-MM-DD
+                return datetime.strptime(raw_date, "%Y-%m-%d")
+            except ValueError:
+                logger.warning(f"Unexpected folder date format: {raw_date}")
+                return None
+
+        return None
 
     def _create_placeholder_record(
         self,
         cs_name: str,
         ctrl_id: str,
-        ctrl_name: str,
+        ctrl_name: str = "Unknown control",
         reason: str = "No evidence found",
-    ) -> Dict[str, Any]:
+    ):
+        """
+        Build a placeholder evidence record when we can't pull real evidence.
+
+        cs_name  – name of the control set (e.g., 'Logical and Physical Access Controls')
+        ctrl_id  – control identifier (e.g., 'CC6.3' or raw Audit Manager Id)
+        ctrl_name – friendly control name
+        reason   – why this is a placeholder (shown in the 'summary' column)
+        """
         return {
             "ControlSetName": cs_name,
             "ControlId": ctrl_id,
@@ -279,6 +330,8 @@ class AuditReportGenerator:
             "ResourceArn": "N/A",
             "Severity": "LOW",
         }
+
+
 
     def _determine_compliance_status(self, evidence: Dict[str, Any]) -> str:
         if "complianceCheck" in evidence:
@@ -300,23 +353,22 @@ class AuditReportGenerator:
 
     # -------------------------- CSV summary -------------------------- #
 
-    def generate_csv_summary_and_store(self, evidence_records: List[Dict[str, Any]]) -> str:
+    def generate_csv_summary_and_store(self, evidence_records):
         """
         Write a slimmed-down CSV for RAG indexing.
 
         Columns:
         - framework, control_id, service, severity, summary, details, timestamp
 
-        Normalization:
-        - control_id matches SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
-        - framework read from soc2_controls.csv when available (else defaults to SOC2)
+        Now normalized so:
+        - control_id matches your SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
+        - framework can be read from soc2_controls.csv if present (else defaults to SOC2)
         """
         if not evidence_records:
             logger.warning("No evidence records – CSV summary will be empty placeholder.")
-            evidence_records = [
-                self._create_placeholder_record("N/A", "N/A", "N/A")
-            ]
+            evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
 
+        # Load your 28-control mapping once
         soc2_mapping = load_soc2_mapping()
 
         csv_buffer = StringIO()
@@ -333,8 +385,24 @@ class AuditReportGenerator:
         writer.writeheader()
 
         for rec in evidence_records:
+            # 🔧 PATCH: ensure rec is always a dict (never a bare string)
+            if not isinstance(rec, dict):
+                rec = {
+                    "ControlSetName": "Unknown",
+                    "ControlId": "UNKNOWN",
+                    "ControlName": "Unknown",
+                    "EvidenceDate": "N/A",
+                    "EvidenceType": "Error",
+                    "ComplianceStatus": "UNKNOWN",
+                    "Finding": str(rec),
+                    "ResourceArn": "",
+                    "Severity": "LOW",
+                }
+
+            # Derive normalized SOC2 control ID
             soc2_id = infer_soc2_control_id(rec, soc2_mapping)
 
+            # Derive service from ResourceArn if present
             arn = rec.get("ResourceArn", "") or ""
             if "s3" in arn:
                 service = "S3"
@@ -347,6 +415,7 @@ class AuditReportGenerator:
             else:
                 service = "Unknown"
 
+            # Pull framework from mapping if available; default to SOC2
             meta = soc2_mapping.get(soc2_id, {})
             framework = meta.get("framework", "SOC2")
 
@@ -364,8 +433,8 @@ class AuditReportGenerator:
 
         csv_buffer.seek(0)
 
-        date_path = datetime.utcnow().strftime("%Y/%m/%d")
-        filename = f"SOC2_Weekly_Summary_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
+        date_path = datetime.now().strftime("%Y/%m/%d")
+        filename = f"SOC2_Weekly_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         s3_key = f"weekly/{date_path}/{filename}"
 
         self.s3.put_object(
@@ -374,7 +443,7 @@ class AuditReportGenerator:
             Body=csv_buffer.getvalue().encode("utf-8"),
             ContentType="text/csv",
         )
-        logger.info("Stored CSV summary in S3: s3://%s/%s", self.s3_bucket, s3_key)
+        logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
         return s3_key
 
     # ---------------------------- Email ------------------------------ #
@@ -496,31 +565,31 @@ class AuditReportGenerator:
         Returns markdown bullet points. Falls back to static text if Bedrock fails.
         """
         prompt = f"""
-You are a senior cloud security and GRC engineer.
+    You are a senior cloud security and GRC engineer.
 
-You are writing the **Key Recommendations** section of a weekly SOC 2 audit email
-for a CISO and audit team. You are given the weekly compliance snapshot:
+    You are writing the **Key Recommendations** section of a weekly SOC 2 audit email
+    for a CISO and audit team. You are given the weekly compliance snapshot:
 
-- Total controls evaluated: {summary['total_controls']}
-- Passing controls: {summary['passed_controls']}
-- Failing controls: {summary['failed_controls']}
-- Unknown / manual review: {summary['unknown_controls']}
-- Overall compliance rate: {summary['compliance_rate']:.1f}%
-- Failed findings with Critical/High severity: {summary['critical_high']}
-- Failed findings with Medium severity: {summary['medium']}
+    - Total controls evaluated: {summary['total_controls']}
+    - Passing controls: {summary['passed_controls']}
+    - Failing controls: {summary['failed_controls']}
+    - Unknown / manual review: {summary['unknown_controls']}
+    - Overall compliance rate: {summary['compliance_rate']:.1f}%
+    - Failed findings with Critical/High severity: {summary['critical_high']}
+    - Failed findings with Medium severity: {summary['medium']}
 
-Write 3–5 short bullet points grouped by priority:
+    Write 3–5 short bullet points grouped by priority:
 
-- High Priority
-- Medium Priority
-- Ongoing
+    - High Priority
+    - Medium Priority
+    - Ongoing
 
-Each bullet should be 1–2 sentences, focused on **what to do next week**
-(remediation, owners, and monitoring). Do NOT restate the raw numbers, and do NOT
-mention that an AI wrote this. Keep it under 150 words total.
+    Each bullet should be 1–2 sentences, focused on **what to do next week**
+    (remediation, owners, and monitoring). Do NOT restate the raw numbers, and do NOT
+    mention that an AI wrote this. Keep it under 150 words total.
 
-Return ONLY markdown bullet points (no headings, no intro, no outro).
-"""
+    Return ONLY markdown bullet points (no headings, no intro, no outro).
+    """.strip()
 
         try:
             body = json.dumps(
@@ -536,24 +605,28 @@ Return ONLY markdown bullet points (no headings, no intro, no outro).
                 }
             )
 
+            # NOTE: use the global BEDROCK_CLAUDE_MODEL_ID and the self.bedrock client
             resp = self.bedrock.invoke_model(
-                modelId=self.bedrock_model_id,
+                modelId=BEDROCK_CLAUDE_MODEL_ID,
                 body=body,
+                contentType="application/json",
+                accept="application/json",
             )
             resp_body = json.loads(resp["body"].read())
-            # Anthropic-style response
-            content = resp_body["output"]["message"]["content"]
-            text_parts = [c["text"] for c in content if c.get("type") == "text"]
-            text = "\n".join(text_parts).strip()
+
+            # Claude 3 on Bedrock: {"content":[{"type":"text","text":"..."}], ...}
+            content = resp_body.get("content", [])
+            text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+            text = "\n".join([t for t in text_parts if t]).strip()
 
             if not text:
                 raise ValueError("Empty Bedrock response")
 
             return text
 
-        except (BotoCoreError, ClientError, KeyError, ValueError, Exception) as e:
+        except Exception as e:
             logger.warning(f"Bedrock recommendations failed, using static text. Error: {e}")
-            # Fallback: static bullets (very similar to what you had)
+            # Fallback: static bullets
             return (
                 "- **High Priority:** Review and address all FAILED controls with Critical/High severity. "
                 "Confirm ownership and open remediation tickets in your GRC backlog.\n"
@@ -562,6 +635,75 @@ Return ONLY markdown bullet points (no headings, no intro, no outro).
                 "- **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager. "
                 "Re-run this report after major changes or incidents."
             )
+    def build_ai_exec_summary(self, summary: dict) -> str:
+        """
+        Generate a full paragraph-style executive summary for the weekly SOC 2 report
+        using Claude via Bedrock. This appears ABOVE the bullet-style recommendations.
+        """
+        prompt = f"""
+    You are a senior cloud security and GRC engineer. 
+    Write a SINGLE PARAGRAPH executive summary (5–7 sentences) for a weekly SOC 2 audit report.
+
+    Use the metrics below to describe:
+    - overall security posture
+    - whether compliance is improving or worsening
+    - themes seen in control failures
+    - business risk implications
+    - what the organization should prioritize next week
+
+    DO NOT restate the raw numbers exactly.
+    DO NOT create bullet points.
+    DO NOT say 'in summary' or 'overall'.  
+    Write like a CISO briefing another CISO.
+
+    Metrics:
+    - Total controls evaluated: {summary['total_controls']}
+    - Passed: {summary['passed_controls']}
+    - Failed: {summary['failed_controls']}
+    - Unknown: {summary['unknown_controls']}
+    - Compliance rate: {summary['compliance_rate']:.1f}%
+    - Critical/High failures: {summary['critical_high']}
+    - Medium failures: {summary['medium']}
+    """
+
+        try:
+            body = json.dumps({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    }
+                ],
+                "max_tokens": 400,
+                "temperature": 0.3,
+            })
+
+            resp = self.bedrock.invoke_model(
+                modelId=self.bedrock_model_id,
+                body=body,
+            )
+            resp_body = json.loads(resp["body"].read())
+
+            content = resp_body["output"]["message"]["content"]
+            text_parts = [c["text"] for c in content if c.get("type") == "text"]
+            paragraph = " ".join(text_parts).strip()
+
+            if not paragraph:
+                raise ValueError("Claude returned empty executive summary.")
+
+            return paragraph
+
+        except Exception as e:
+            logger.warning(f"AI exec summary failed, using fallback. Error: {e}")
+            return (
+                "This week's compliance posture shows notable areas requiring attention. "
+                "Control failures indicate opportunities to strengthen IAM, logging, and "
+                "configuration management processes, while medium-severity issues highlight "
+                "gaps that should be scheduled for review next week. Continue focusing on "
+                "closing findings tied directly to customer-impacting risks and maintaining "
+                "strong evidence collection for audit readiness."
+            )
+        
     def _compute_summary_metrics(self, evidence_records):
         """Compute simple exec-summary stats from the evidence list."""
         # Unique controls by ID
@@ -683,21 +825,15 @@ This report was generated automatically by the FAFO Continuous Compliance engine
         subject = f"Weekly SOC 2 Audit Summary – {today}"
 
         # Ask Claude (via Bedrock) for Key Recommendations
+        ai_exec_summary = self.build_ai_exec_summary(summary)
         ai_recommendations = self.build_ai_recommendations(summary)
 
         body = f"""Weekly SOC 2 Audit Summary – {today}
 
 # Weekly SOC 2 Audit Summary
 
-## Executive Summary
-
-Your weekly SOC 2 compliance snapshot is ready.
-
-- Total controls evaluated: {summary['total_controls']}
-- Passing controls: {summary['passed_controls']}
-- Failing controls: {summary['failed_controls']}
-- Unknown / manual review: {summary['unknown_controls']}
-- Overall compliance rate: {summary['compliance_rate']:.1f}%
+## AI Executive Summary
+{ai_exec_summary}
 
 ## Key Recommendations
 
@@ -705,8 +841,8 @@ Your weekly SOC 2 compliance snapshot is ready.
 
 ## Next Steps
 
-- Download the full CSV evidence summary for detailed, control-by-control review:
-  {presigned_url}
+Download the detailed CSV evidence summary:
+{presigned_url}
 
 For each failing control, confirm ownership, create remediation tickets,
 and track progress in your GRC backlog.
@@ -727,10 +863,6 @@ This report was generated automatically by the FAFO Continuous Compliance engine
         logger.info(
             "Sent notifications to %d recipients", len(self.report_recipients)
         )
-
-
-
-
 
 # -------------------------------------------------------------------
 # Lambda entry point
