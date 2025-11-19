@@ -4,6 +4,7 @@ import os
 import json
 from datetime import datetime
 import boto3
+from pathlib import Path
 from pinecone import Pinecone, ServerlessSpec
 # or however you already init Pinecone
 from dotenv import load_dotenv
@@ -13,8 +14,8 @@ load_dotenv()
 s3 = boto3.client("s3")
 
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
-PINECONE_INDEX_NAME = os.environ["PINECONE_INDEX_NAME"]
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-ada-002")  # example
+PINECONE_INDEX_NAME = os.environ["PINECONE_INDEX"]
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")  # example
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)

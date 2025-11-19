@@ -22,6 +22,7 @@ Stored metadata includes:
 import csv
 import json
 import os
+from dotenv import load_dotenv
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,7 +30,8 @@ import boto3
 import botocore
 from pinecone import Pinecone, ServerlessSpec, Index
 #from pinecone_text.sparse import BM25Encoder
-
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 #bm25 = BM25Encoder().default()
 
 
