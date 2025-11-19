@@ -3,10 +3,12 @@ import io
 import os
 import json
 from datetime import datetime
-
 import boto3
 from pinecone import Pinecone, ServerlessSpec
 # or however you already init Pinecone
+from dotenv import load_dotenv
+
+load_dotenv()
 
 s3 = boto3.client("s3")
 

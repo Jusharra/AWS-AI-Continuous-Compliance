@@ -25,9 +25,9 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from collections import Counter
 from botocore.config import Config
+from dotenv import load_dotenv
 
-
-
+load_dotenv()
 
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 BEDROCK_CLAUDE_MODEL_ID = os.environ.get(

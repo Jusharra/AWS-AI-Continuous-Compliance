@@ -2,13 +2,13 @@
 import json
 import logging
 from typing import Any, Dict
-
+from dotenv import load_dotenv
 from modules import remediation_actions
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-
+load_dotenv()
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
     Entry point for the FAFO remediation Lambda.
