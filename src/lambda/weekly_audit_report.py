@@ -125,7 +125,7 @@ class AuditReportGenerator:
         self.assessment_id = os.environ.get(
             "ASSESSMENT_ID", "faeae42c-09e6-4251-a0e3-28e5e021fcd2"
         )
-        self.s3_bucket = os.environ.get("S3_BUCKET", "fafo-audit-reports")
+        self.s3_bucket = os.environ.get("S3_BUCKET", "fafo-continuous-compliance-evidence-281517525855")
         self.report_recipients = os.environ.get(
             "REPORT_RECIPIENTS", "qjgoree@gmail.com"
         ).split(",")
@@ -139,7 +139,7 @@ class AuditReportGenerator:
         # Model can be overridden via ENV, otherwise Claude Sonnet
         self.bedrock_model_id = os.environ.get(
             "BEDROCK_CLAUDE_MODEL_ID",
-            "anthropic.claude-3-sonnet-20240229-v1:0"
+            "anthropic.claude-sonnet-4-5-20250929"
         )
 
 
@@ -163,7 +163,7 @@ class AuditReportGenerator:
     def collect_evidence_by_control(self, control_sets):
         """Collect the latest evidence for each SOC 2 control."""
         evidence_records = []
-        evidence_cutoff = datetime.utcnow() - timedelta(days=7)
+        evidence_cutoff_date = (datetime.utcnow() - timedelta(days=7)).date()
 
         for cs in control_sets:
             cs_name = cs.get("name", "Unknown control set")
@@ -182,26 +182,26 @@ class AuditReportGenerator:
                     )
                     folders = resp.get("evidenceFolders", []) or []
 
-                    # No folders at all → placeholder
                     if not folders:
+                        # No folders at all → placeholder
                         evidence_records.append(
                             self._create_placeholder_record(
-                                cs_name, ctrl_id, ctrl_name, "No evidence folders found"
+                                cs_name,
+                                ctrl_id,
+                                ctrl_name,
+                                "No evidence folders found",
                             )
                         )
                         continue
 
                     latest_evidence: list[dict] = []
 
-                    # Prefer folders with “recent” dates (last 7 days)
+                    # Prefer folders from the last 7 days
                     for folder in folders:
                         raw_date = folder.get("date")
                         folder_date = self._parse_folder_date(raw_date)
 
-                        if (
-                            folder_date is not None
-                            and folder_date >= evidence_cutoff.date()
-                        ):
+                        if folder_date is not None and folder_date >= evidence_cutoff_date:
                             items = self._fetch_evidence_items(
                                 cs_id, ctrl_id, folder.get("id")
                             )
@@ -213,8 +213,7 @@ class AuditReportGenerator:
                     if not latest_evidence:
                         latest_folder = max(
                             folders,
-                            key=lambda f: self._parse_folder_date(f.get("date"))
-                            or datetime.min.date(),
+                            key=lambda f: self._parse_folder_date(f.get("date")) or date.min,
                         )
                         items = self._fetch_evidence_items(
                             cs_id, ctrl_id, latest_folder.get("id")
@@ -243,6 +242,7 @@ class AuditReportGenerator:
         logger.info("Collected %d evidence records", len(evidence_records))
         return evidence_records
 
+
     def _fetch_evidence_items(self, cs_id: str, ctrl_id: str, folder_id: str) -> List[Dict[str, Any]]:
         try:
             resp = self.audit_manager.get_evidence_by_evidence_folder(
@@ -255,6 +255,23 @@ class AuditReportGenerator:
             logger.warning("Error fetching evidence items: %s", e)
             return []
 
+    def _extract_control_code(self, ctrl_name: str, ctrl_id: str) -> str:
+        """
+        Try to get a human-friendly control code (e.g. 'PI1.4') from the control name.
+        Falls back to the raw Audit Manager id if we can't parse it.
+        """
+        if not ctrl_name:
+            return ctrl_id or "UNKNOWN"
+
+        # Many SOC 2 controls look like "PI1.4: The entity implements..."
+        parts = ctrl_name.split(":", 1)
+        if len(parts) > 1:
+            code = parts[0].strip()
+            if code:
+                return code
+
+        return ctrl_id or ctrl_name
+
     def _process_evidence_items(self, items, cs, control, folder):
         """Normalize raw Audit Manager evidence items into our flat record shape."""
         processed = []
@@ -263,17 +280,16 @@ class AuditReportGenerator:
         ctrl_name = control.get("name", "Unknown control")
 
         folder_date = self._parse_folder_date(folder.get("date"))
-        folder_date_str = (
-            folder_date.isoformat() if isinstance(folder_date, datetime) else str(folder_date)
-            if folder_date is not None
-            else "No Evidence"
-        )
+        folder_date_str = folder_date.isoformat() if folder_date else "No Evidence"
+
+        # Use a human-readable control code instead of the UUID
+        control_code = self._extract_control_code(ctrl_name, ctrl_id)
 
         for item in items or []:
             processed.append(
                 {
                     "ControlSetName": cs_name,
-                    "ControlId": ctrl_id,
+                    "ControlId": control_code,   # <— this is what will end up in Excel
                     "ControlName": ctrl_name,
                     "EvidenceDate": folder_date_str,
                     "EvidenceType": item.get("dataSource"),
@@ -286,23 +302,29 @@ class AuditReportGenerator:
                 }
             )
         return processed
+
     def _parse_folder_date(self, raw_date):
-        """Safely parse Audit Manager folder date which may be string or datetime."""
+        """Safely parse Audit Manager folder date into a date object (or None)."""
         if raw_date is None:
             return None
 
         if isinstance(raw_date, datetime):
+            # Use date-only to avoid datetime/date comparison issues
+            return raw_date.date()
+
+        if isinstance(raw_date, date):
             return raw_date
 
         if isinstance(raw_date, str):
             try:
                 # Audit Manager usually uses YYYY-MM-DD
-                return datetime.strptime(raw_date, "%Y-%m-%d")
+                return datetime.strptime(raw_date, "%Y-%m-%d").date()
             except ValueError:
                 logger.warning(f"Unexpected folder date format: {raw_date}")
                 return None
 
         return None
+
 
     def _create_placeholder_record(
         self,
@@ -319,9 +341,11 @@ class AuditReportGenerator:
         ctrl_name – friendly control name
         reason   – why this is a placeholder (shown in the 'summary' column)
         """
+        control_code = self._extract_control_code(ctrl_name, ctrl_id)
+
         return {
             "ControlSetName": cs_name,
-            "ControlId": ctrl_id,
+            "ControlId": control_code,          # friendly code if possible
             "ControlName": ctrl_name,
             "EvidenceDate": "No Evidence",
             "EvidenceType": "Manual Review Required",
@@ -351,6 +375,94 @@ class AuditReportGenerator:
             return attrs["findingSeverity"].upper()
         return "MEDIUM" if self._determine_compliance_status(evidence) == "FAILED" else "LOW"
 
+    def _derive_service_from_record(self, rec: Dict[str, Any]) -> str:
+        """
+        Best-effort mapping of AWS service from EvidenceType / ResourceArn.
+        Keeps 'Unknown' only when we really can't infer anything.
+        """
+        evidence_type = (rec.get("EvidenceType") or "").upper()
+        arn = (rec.get("ResourceArn") or "").lower()
+
+        if "s3" in arn or evidence_type.startswith("S3"):
+            return "S3"
+        if "iam" in arn or evidence_type.startswith("IAM"):
+            return "IAM"
+        if "cloudtrail" in arn:
+            return "CloudTrail"
+        if "ec2" in arn:
+            return "EC2"
+        if "rds" in arn:
+            return "RDS"
+
+        return "General"
+    def _derive_tsc_category(self, rec: dict) -> str:
+        """
+        Map Audit Manager control sets to SOC 2 Trust Service Categories.
+        Uses either ControlSetName or the control_id prefix.
+        """
+        cs = (rec.get("ControlSetName") or "").lower()
+        cid = (rec.get("ControlId") or "").lower()
+
+        # Primary mapping using Audit Manager's control set name
+        if "logical" in cs or "physical" in cs:
+            return "Security"
+        if "risk" in cs:
+            return "Security"
+        if "change" in cs:
+            return "Security"
+        if "system operations" in cs:
+            return "Security"
+        if "monitoring" in cs:
+            return "Security"
+        if "confidential" in cs:
+            return "Confidentiality"
+        if "availability" in cs:
+            return "Availability"
+        if "processing integrity" in cs or "processing" in cs:
+            return "Processing Integrity"
+        if "privacy" in cs:
+            return "Privacy"
+
+        # Backup mapping using the control ID prefix (C1, A1, PI1, P1, etc.)
+        if cid.startswith("c1"):
+            return "Confidentiality"
+        if cid.startswith("a1"):
+            return "Availability"
+        if cid.startswith("pi1"):
+            return "Processing Integrity"
+        if cid.startswith("p1"):
+            return "Privacy"
+
+        # Default SOC 2 category if nothing matches
+        return "Security"
+
+    def _derive_summary_from_record(self, rec: Dict[str, Any]) -> str:
+        """
+        Clean, human-readable summary for the Excel 'summary' column.
+        Hides raw Python errors and folds status + finding into something sane.
+        """
+        status = (rec.get("ComplianceStatus") or "UNKNOWN").upper()
+        finding = (rec.get("Finding") or "").strip()
+
+        # Normalize ugly internal error messages
+        if "Error collecting evidence" in finding:
+            return "Evidence collection error – manual review required"
+
+        if "No evidence folders found" in finding:
+            return "No recent evidence in Audit Manager"
+
+        if status in ("FAILED", "NON_COMPLIANT"):
+            if not finding:
+                return "Control failed – remediation required"
+            return f"FAILED – {finding[:140]}"
+
+        if status in ("PASSED", "COMPLIANT"):
+            return "Evidence OK"
+
+        # Default: just show trimmed finding text
+        return finding[:140] if finding else "No evidence text available"
+     
+
     # -------------------------- CSV summary -------------------------- #
 
     def generate_csv_summary_and_store(self, evidence_records):
@@ -358,7 +470,7 @@ class AuditReportGenerator:
         Write a slimmed-down CSV for RAG indexing.
 
         Columns:
-        - framework, control_id, service, severity, summary, details, timestamp
+        - framework, control_id, tsc_category, service, severity, summary, details, timestamp
 
         Now normalized so:
         - control_id matches your SOC2 IDs (CC6.x, CC7.x, A1.x, C1.x) whenever possible
@@ -366,7 +478,7 @@ class AuditReportGenerator:
         """
         if not evidence_records:
             logger.warning("No evidence records – CSV summary will be empty placeholder.")
-            evidence_records = [self._create_placeholder_record({}, {'id': 'N/A', 'name': 'N/A'})]
+            evidence_records = [self._create_placeholder_record({}, {"id": "N/A", "name": "N/A"})]
 
         # Load your 28-control mapping once
         soc2_mapping = load_soc2_mapping()
@@ -375,9 +487,12 @@ class AuditReportGenerator:
         fieldnames = [
             "framework",
             "control_id",
+            "tsc_category",
             "service",
+            "evidence_source",
             "severity",
             "summary",
+            "remediation_recommended",
             "details",
             "timestamp",
         ]
@@ -385,7 +500,7 @@ class AuditReportGenerator:
         writer.writeheader()
 
         for rec in evidence_records:
-            # 🔧 PATCH: ensure rec is always a dict (never a bare string)
+            # 🔧 Safety: ensure rec is always a dict
             if not isinstance(rec, dict):
                 rec = {
                     "ControlSetName": "Unknown",
@@ -399,23 +514,84 @@ class AuditReportGenerator:
                     "Severity": "LOW",
                 }
 
-            # Derive normalized SOC2 control ID
+            # --- SOC 2 control id (already working) ---
             soc2_id = infer_soc2_control_id(rec, soc2_mapping)
 
-            # Derive service from ResourceArn if present
-            arn = rec.get("ResourceArn", "") or ""
-            if "s3" in arn:
-                service = "S3"
-            elif "config" in arn:
+            # --- SERVICE column (Security Hub + others) ---
+            evidence_type = (rec.get("EvidenceType") or "").lower()
+            arn = (rec.get("ResourceArn") or "").lower()
+
+            if "security_findings" in evidence_type or "securityhub" in evidence_type:
+                service = "Security Hub"
+            elif "config" in evidence_type or ":config:" in arn:
                 service = "Config"
-            elif "securityhub" in arn:
-                service = "SecurityHub"
+            elif "s3" in arn:
+                service = "S3"
+            elif "iam" in arn:
+                service = "IAM"
+            elif "cloudtrail" in arn:
+                service = "CloudTrail"
             elif "lambda" in arn:
                 service = "Lambda"
             else:
-                service = "Unknown"
+                service = "General"
 
-            # Pull framework from mapping if available; default to SOC2
+            # --- EVIDENCE SOURCE column ---
+            if "security_findings" in evidence_type or "securityhub" in evidence_type:
+                evidence_source = "Security Hub"
+            elif "config" in evidence_type or ":config:" in arn:
+                evidence_source = "Config"
+            elif "manual review required" in evidence_type:
+                evidence_source = "Manual"
+            else:
+                evidence_source = "Other/Unknown"
+
+            # --- SUMMARY column (Security Hub-aware, no raw Python errors) ---
+            status = (rec.get("ComplianceStatus") or "UNKNOWN").upper()
+            finding = (rec.get("Finding") or "").strip()
+            finding_lower = finding.lower()
+
+            # Security Hub specific phrasing
+            if service == "Security Hub":
+                if status in ("FAILED", "NON_COMPLIANT"):
+                    summary = f"Security Hub FAILED – {finding[:120] or 'see findings in console'}"
+                elif status in ("PASSED", "COMPLIANT"):
+                    summary = "Security Hub COMPLIANT"
+                else:
+                    summary = f"Security Hub – {finding[:120] or 'status UNKNOWN'}"
+            else:
+                if "no evidence folders found" in finding_lower:
+                    summary = "No recent Audit Manager evidence"
+                elif "error collecting evidence" in finding_lower:
+                    summary = "Evidence collection error – manual review required"
+                elif status in ("FAILED", "NON_COMPLIANT"):
+                    summary = f"FAILED – {finding[:120] or 'remediation required'}"
+                elif status in ("PASSED", "COMPLIANT"):
+                    summary = "Evidence OK"
+                else:
+                    summary = finding[:120] if finding else "No evidence text available"
+
+             # --- REMEDIATION RECOMMENDED column ---
+            sev = (rec.get("Severity") or "LOW").upper()
+            summary_lower = summary.lower()
+
+            if status in ("FAILED", "NON_COMPLIANT"):
+                remediation_recommended = "Yes"
+            elif "error collection" in summary_lower or "manual review" in summary_lower:
+                remediation_recommended = "Yes"
+            elif "no recent audit manager evidence" in summary_lower:
+                remediation_recommended = "Review"
+            elif status in ("PASSED", "COMPLIANT") and sev in ("LOW", "INFORMATIONAL"):
+                remediation_recommended = "No"
+            else:
+                remediation_recommended = "Review"
+
+            # --- TIMESTAMP column (hide 'No Evidence') ---
+            timestamp = rec.get("EvidenceDate", "")
+            if isinstance(timestamp, str) and timestamp.strip().lower() == "no evidence":
+                timestamp = ""
+
+            # Framework from mapping, default SOC2
             meta = soc2_mapping.get(soc2_id, {})
             framework = meta.get("framework", "SOC2")
 
@@ -423,11 +599,14 @@ class AuditReportGenerator:
                 {
                     "framework": framework,
                     "control_id": soc2_id,
+                    "tsc_category": self._derive_tsc_category(rec),
                     "service": service,
+                    "evidence_source": evidence_source,
                     "severity": rec.get("Severity", "LOW"),
-                    "summary": rec.get("Finding", ""),
+                    "summary": summary,
+                    "remediation_recommended": remediation_recommended,
                     "details": f"{rec.get('ControlName','')} in {rec.get('ControlSetName','')} – {rec.get('EvidenceType','')}",
-                    "timestamp": rec.get("EvidenceDate", ""),
+                    "timestamp": timestamp,
                 }
             )
 
@@ -446,423 +625,425 @@ class AuditReportGenerator:
         logger.info(f"Stored CSV summary in S3: s3://{self.s3_bucket}/{s3_key}")
         return s3_key
 
-    # ---------------------------- Email ------------------------------ #
-    
+
+        # ---------------------------- Email ------------------------------ #
+        
     def compute_summary_metrics(self, evidence_records):
-        """
-        Compute simple executive-level metrics from the evidence records.
-        Returns a dict with totals and a short text summary.
-        """
-        if not evidence_records:
+            """
+            Compute simple executive-level metrics from the evidence records.
+            Returns a dict with totals and a short text summary.
+            """
+            if not evidence_records:
+                return {
+                    "total_controls": 0,
+                    "passed_controls": 0,
+                    "failed_controls": 0,
+                    "unknown_controls": 0,
+                    "summary_text": "No evidence records were collected for this run.",
+                }
+
+            # Unique controls overall
+            all_controls = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
+            total_controls = len(all_controls)
+
+            # Controls by status (using first status we see per control)
+            status_by_control = {}
+            for rec in evidence_records:
+                cid = rec.get("ControlId")
+                status = (rec.get("ComplianceStatus") or "UNKNOWN").upper()
+                if not cid:
+                    continue
+                # Only set once – first status wins
+                status_by_control.setdefault(cid, status)
+
+            passed_controls = {c for c, s in status_by_control.items() if s == "PASSED"}
+            failed_controls = {c for c, s in status_by_control.items() if s == "FAILED"}
+            unknown_controls = {c for c, s in status_by_control.items() if s not in ("PASSED", "FAILED")}
+
+            compliance_rate = 0.0
+            if total_controls > 0:
+                compliance_rate = (len(passed_controls) / total_controls) * 100.0
+
+            # Build a short, human-readable summary string
+            summary_lines = [
+                f"Total controls evaluated: {total_controls}",
+                f"Passing controls: {len(passed_controls)}",
+                f"Failing controls: {len(failed_controls)}",
+                f"Unknown / manual review: {len(unknown_controls)}",
+                f"Overall compliance rate: {compliance_rate:.1f}%",
+            ]
+
+            # Optionally call out up to 5 failing controls
+            if failed_controls:
+                top_failed = sorted(list(failed_controls))[:5]
+                summary_lines.append("")
+                summary_lines.append("Sample failing controls (up to 5):")
+                for cid in top_failed:
+                    summary_lines.append(f"- {cid}")
+
             return {
-                "total_controls": 0,
-                "passed_controls": 0,
-                "failed_controls": 0,
-                "unknown_controls": 0,
-                "summary_text": "No evidence records were collected for this run.",
+                "total_controls": total_controls,
+                "passed_controls": len(passed_controls),
+                "failed_controls": len(failed_controls),
+                "unknown_controls": len(unknown_controls),
+                "compliance_rate": compliance_rate,
+                "summary_text": "\n".join(summary_lines),
+            }
+    
+    def build_summary(self, evidence_records):
+            """
+            Build a simple executive summary from evidence records.
+            """
+            # Unique controls (by ControlId)
+            control_ids = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
+            total_controls = len(control_ids)
+
+            passing_ids = {
+                rec.get("ControlId")
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "PASSED"
+            }
+            failing_ids = {
+                rec.get("ControlId")
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "FAILED"
             }
 
-        # Unique controls overall
-        all_controls = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
-        total_controls = len(all_controls)
+            passed_controls = len(passing_ids)
+            failed_controls = len(failing_ids)
+            unknown_controls = max(total_controls - passed_controls - failed_controls, 0)
 
-        # Controls by status (using first status we see per control)
-        status_by_control = {}
-        for rec in evidence_records:
-            cid = rec.get("ControlId")
-            status = (rec.get("ComplianceStatus") or "UNKNOWN").upper()
-            if not cid:
-                continue
-            # Only set once – first status wins
-            status_by_control.setdefault(cid, status)
+            compliance_rate = (passed_controls / total_controls * 100.0) if total_controls else 0.0
 
-        passed_controls = {c for c, s in status_by_control.items() if s == "PASSED"}
-        failed_controls = {c for c, s in status_by_control.items() if s == "FAILED"}
-        unknown_controls = {c for c, s in status_by_control.items() if s not in ("PASSED", "FAILED")}
+            # Rough “risk” counters – you can tweak this later
+            critical_high = sum(
+                1
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "FAILED"
+                and rec.get("Severity", "").upper() in ("CRITICAL", "HIGH")
+            )
+            medium = sum(
+                1
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "FAILED"
+                and rec.get("Severity", "").upper() == "MEDIUM"
+            )
 
-        compliance_rate = 0.0
-        if total_controls > 0:
-            compliance_rate = (len(passed_controls) / total_controls) * 100.0
-
-        # Build a short, human-readable summary string
-        summary_lines = [
-            f"Total controls evaluated: {total_controls}",
-            f"Passing controls: {len(passed_controls)}",
-            f"Failing controls: {len(failed_controls)}",
-            f"Unknown / manual review: {len(unknown_controls)}",
-            f"Overall compliance rate: {compliance_rate:.1f}%",
-        ]
-
-        # Optionally call out up to 5 failing controls
-        if failed_controls:
-            top_failed = sorted(list(failed_controls))[:5]
-            summary_lines.append("")
-            summary_lines.append("Sample failing controls (up to 5):")
-            for cid in top_failed:
-                summary_lines.append(f"- {cid}")
-
-        return {
-            "total_controls": total_controls,
-            "passed_controls": len(passed_controls),
-            "failed_controls": len(failed_controls),
-            "unknown_controls": len(unknown_controls),
-            "compliance_rate": compliance_rate,
-            "summary_text": "\n".join(summary_lines),
-        }
-  
-    def build_summary(self, evidence_records):
-        """
-        Build a simple executive summary from evidence records.
-        """
-        # Unique controls (by ControlId)
-        control_ids = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
-        total_controls = len(control_ids)
-
-        passing_ids = {
-            rec.get("ControlId")
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "PASSED"
-        }
-        failing_ids = {
-            rec.get("ControlId")
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "FAILED"
-        }
-
-        passed_controls = len(passing_ids)
-        failed_controls = len(failing_ids)
-        unknown_controls = max(total_controls - passed_controls - failed_controls, 0)
-
-        compliance_rate = (passed_controls / total_controls * 100.0) if total_controls else 0.0
-
-        # Rough “risk” counters – you can tweak this later
-        critical_high = sum(
-            1
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "FAILED"
-            and rec.get("Severity", "").upper() in ("CRITICAL", "HIGH")
-        )
-        medium = sum(
-            1
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "FAILED"
-            and rec.get("Severity", "").upper() == "MEDIUM"
-        )
-
-        return {
-            "total_controls": total_controls,
-            "passed_controls": passed_controls,
-            "failed_controls": failed_controls,
-            "unknown_controls": unknown_controls,
-            "compliance_rate": compliance_rate,
-            "critical_high": critical_high,
-            "medium": medium,
-        }
+            return {
+                "total_controls": total_controls,
+                "passed_controls": passed_controls,
+                "failed_controls": failed_controls,
+                "unknown_controls": unknown_controls,
+                "compliance_rate": compliance_rate,
+                "critical_high": critical_high,
+                "medium": medium,
+            }
+            
     def build_ai_recommendations(self, summary: dict) -> str:
+            """
+            Use Claude via Bedrock to generate short, exec-level key recommendations.
+
+            Returns markdown bullet points. Falls back to static text if Bedrock fails.
+            """
+            prompt = f"""
+        You are a senior cloud security and GRC engineer.
+
+        You are writing the **Key Recommendations** section of a weekly SOC 2 audit email
+        for a CISO and audit team. You are given the weekly compliance snapshot:
+
+        - Total controls evaluated: {summary['total_controls']}
+        - Passing controls: {summary['passed_controls']}
+        - Failing controls: {summary['failed_controls']}
+        - Unknown / manual review: {summary['unknown_controls']}
+        - Overall compliance rate: {summary['compliance_rate']:.1f}%
+        - Failed findings with Critical/High severity: {summary['critical_high']}
+        - Failed findings with Medium severity: {summary['medium']}
+
+        Write 3–5 short bullet points grouped by priority:
+
+        - High Priority
+        - Medium Priority
+        - Ongoing
+
+        Each bullet should be 1–2 sentences, focused on **what to do next week**
+        (remediation, owners, and monitoring). Do NOT restate the raw numbers, and do NOT
+        mention that an AI wrote this. Keep it under 150 words total.
+
+        Return ONLY markdown bullet points (no headings, no intro, no outro).
+        """.strip()
+
+            try:
+                body = json.dumps(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "text", "text": prompt}],
+                            }
+                        ],
+                        "max_tokens": 300,
+                        "temperature": 0.2,
+                    }
+                )
+
+                # NOTE: use the global BEDROCK_CLAUDE_MODEL_ID and the self.bedrock client
+                resp = self.bedrock.invoke_model(
+                    modelId=BEDROCK_CLAUDE_MODEL_ID,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                resp_body = json.loads(resp["body"].read())
+
+                # Claude 3 on Bedrock: {"content":[{"type":"text","text":"..."}], ...}
+                content = resp_body.get("content", [])
+                text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                text = "\n".join([t for t in text_parts if t]).strip()
+
+                if not text:
+                    raise ValueError("Empty Bedrock response")
+
+                return text
+
+            except Exception as e:
+                logger.warning(f"Bedrock recommendations failed, using static text. Error: {e}")
+                # Fallback: static bullets
+                return (
+                    "- **High Priority:** Review and address all FAILED controls with Critical/High severity. "
+                    "Confirm ownership and open remediation tickets in your GRC backlog.\n"
+                    "- **Medium Priority:** Work through remaining FAILED controls with Medium severity, "
+                    "focusing on production accounts and internet-exposed resources.\n"
+                    "- **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager. "
+                    "Re-run this report after major changes or incidents."
+                )
+    def build_ai_exec_summary(self, summary: dict) -> str:
+            """
+            Generate a full paragraph-style executive summary for the weekly SOC 2 report
+            using Claude via Bedrock. This appears ABOVE the bullet-style recommendations.
+            """
+            prompt = f"""
+        You are a senior cloud security and GRC engineer. 
+        Write a SINGLE PARAGRAPH executive summary (5–7 sentences) for a weekly SOC 2 audit report.
+
+        Use the metrics below to describe:
+        - overall security posture
+        - whether compliance is improving or worsening
+        - themes seen in control failures
+        - business risk implications
+        - what the organization should prioritize next week
+
+        DO NOT restate the raw numbers exactly.
+        DO NOT create bullet points.
+        DO NOT say 'in summary' or 'overall'.  
+        Write like a CISO briefing another CISO.
+
+        Metrics:
+        - Total controls evaluated: {summary['total_controls']}
+        - Passed: {summary['passed_controls']}
+        - Failed: {summary['failed_controls']}
+        - Unknown: {summary['unknown_controls']}
+        - Compliance rate: {summary['compliance_rate']:.1f}%
+        - Critical/High failures: {summary['critical_high']}
+        - Medium failures: {summary['medium']}
         """
-        Use Claude via Bedrock to generate short, exec-level key recommendations.
 
-        Returns markdown bullet points. Falls back to static text if Bedrock fails.
-        """
-        prompt = f"""
-    You are a senior cloud security and GRC engineer.
-
-    You are writing the **Key Recommendations** section of a weekly SOC 2 audit email
-    for a CISO and audit team. You are given the weekly compliance snapshot:
-
-    - Total controls evaluated: {summary['total_controls']}
-    - Passing controls: {summary['passed_controls']}
-    - Failing controls: {summary['failed_controls']}
-    - Unknown / manual review: {summary['unknown_controls']}
-    - Overall compliance rate: {summary['compliance_rate']:.1f}%
-    - Failed findings with Critical/High severity: {summary['critical_high']}
-    - Failed findings with Medium severity: {summary['medium']}
-
-    Write 3–5 short bullet points grouped by priority:
-
-    - High Priority
-    - Medium Priority
-    - Ongoing
-
-    Each bullet should be 1–2 sentences, focused on **what to do next week**
-    (remediation, owners, and monitoring). Do NOT restate the raw numbers, and do NOT
-    mention that an AI wrote this. Keep it under 150 words total.
-
-    Return ONLY markdown bullet points (no headings, no intro, no outro).
-    """.strip()
-
-        try:
-            body = json.dumps(
-                {
+            try:
+                body = json.dumps({
                     "messages": [
                         {
                             "role": "user",
                             "content": [{"type": "text", "text": prompt}],
                         }
                     ],
-                    "max_tokens": 300,
-                    "temperature": 0.2,
-                }
-            )
+                    "max_tokens": 400,
+                    "temperature": 0.3,
+                })
 
-            # NOTE: use the global BEDROCK_CLAUDE_MODEL_ID and the self.bedrock client
-            resp = self.bedrock.invoke_model(
-                modelId=BEDROCK_CLAUDE_MODEL_ID,
-                body=body,
-                contentType="application/json",
-                accept="application/json",
-            )
-            resp_body = json.loads(resp["body"].read())
+                resp = self.bedrock.invoke_model(
+                    modelId=self.bedrock_model_id,
+                    body=body,
+                )
+                resp_body = json.loads(resp["body"].read())
 
-            # Claude 3 on Bedrock: {"content":[{"type":"text","text":"..."}], ...}
-            content = resp_body.get("content", [])
-            text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
-            text = "\n".join([t for t in text_parts if t]).strip()
+                content = resp_body["output"]["message"]["content"]
+                text_parts = [c["text"] for c in content if c.get("type") == "text"]
+                paragraph = " ".join(text_parts).strip()
 
-            if not text:
-                raise ValueError("Empty Bedrock response")
+                if not paragraph:
+                    raise ValueError("Claude returned empty executive summary.")
 
-            return text
+                return paragraph
 
-        except Exception as e:
-            logger.warning(f"Bedrock recommendations failed, using static text. Error: {e}")
-            # Fallback: static bullets
-            return (
-                "- **High Priority:** Review and address all FAILED controls with Critical/High severity. "
-                "Confirm ownership and open remediation tickets in your GRC backlog.\n"
-                "- **Medium Priority:** Work through remaining FAILED controls with Medium severity, "
-                "focusing on production accounts and internet-exposed resources.\n"
-                "- **Ongoing:** Maintain weekly monitoring of AWS Config, Security Hub, and Audit Manager. "
-                "Re-run this report after major changes or incidents."
-            )
-    def build_ai_exec_summary(self, summary: dict) -> str:
-        """
-        Generate a full paragraph-style executive summary for the weekly SOC 2 report
-        using Claude via Bedrock. This appears ABOVE the bullet-style recommendations.
-        """
-        prompt = f"""
-    You are a senior cloud security and GRC engineer. 
-    Write a SINGLE PARAGRAPH executive summary (5–7 sentences) for a weekly SOC 2 audit report.
-
-    Use the metrics below to describe:
-    - overall security posture
-    - whether compliance is improving or worsening
-    - themes seen in control failures
-    - business risk implications
-    - what the organization should prioritize next week
-
-    DO NOT restate the raw numbers exactly.
-    DO NOT create bullet points.
-    DO NOT say 'in summary' or 'overall'.  
-    Write like a CISO briefing another CISO.
-
-    Metrics:
-    - Total controls evaluated: {summary['total_controls']}
-    - Passed: {summary['passed_controls']}
-    - Failed: {summary['failed_controls']}
-    - Unknown: {summary['unknown_controls']}
-    - Compliance rate: {summary['compliance_rate']:.1f}%
-    - Critical/High failures: {summary['critical_high']}
-    - Medium failures: {summary['medium']}
-    """
-
-        try:
-            body = json.dumps({
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": prompt}],
-                    }
-                ],
-                "max_tokens": 400,
-                "temperature": 0.3,
-            })
-
-            resp = self.bedrock.invoke_model(
-                modelId=self.bedrock_model_id,
-                body=body,
-            )
-            resp_body = json.loads(resp["body"].read())
-
-            content = resp_body["output"]["message"]["content"]
-            text_parts = [c["text"] for c in content if c.get("type") == "text"]
-            paragraph = " ".join(text_parts).strip()
-
-            if not paragraph:
-                raise ValueError("Claude returned empty executive summary.")
-
-            return paragraph
-
-        except Exception as e:
-            logger.warning(f"AI exec summary failed, using fallback. Error: {e}")
-            return (
-                "This week's compliance posture shows notable areas requiring attention. "
-                "Control failures indicate opportunities to strengthen IAM, logging, and "
-                "configuration management processes, while medium-severity issues highlight "
-                "gaps that should be scheduled for review next week. Continue focusing on "
-                "closing findings tied directly to customer-impacting risks and maintaining "
-                "strong evidence collection for audit readiness."
-            )
-        
+            except Exception as e:
+                logger.warning(f"AI exec summary failed, using fallback. Error: {e}")
+                return (
+                    "This week's compliance posture shows notable areas requiring attention. "
+                    "Control failures indicate opportunities to strengthen IAM, logging, and "
+                    "configuration management processes, while medium-severity issues highlight "
+                    "gaps that should be scheduled for review next week. Continue focusing on "
+                    "closing findings tied directly to customer-impacting risks and maintaining "
+                    "strong evidence collection for audit readiness."
+                )
+            
     def _compute_summary_metrics(self, evidence_records):
-        """Compute simple exec-summary stats from the evidence list."""
-        # Unique controls by ID
-        control_ids = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
-        total_controls = len(control_ids)
+            """Compute simple exec-summary stats from the evidence list."""
+            # Unique controls by ID
+            control_ids = {rec.get("ControlId") for rec in evidence_records if rec.get("ControlId")}
+            total_controls = len(control_ids)
 
-        passed_controls = {
-            rec.get("ControlId")
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "PASSED"
-        }
-        failed_controls = {
-            rec.get("ControlId")
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "FAILED"
-        }
+            passed_controls = {
+                rec.get("ControlId")
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "PASSED"
+            }
+            failed_controls = {
+                rec.get("ControlId")
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "FAILED"
+            }
 
-        passing = len(passed_controls)
-        failing = len(failed_controls)
-        unknown = max(total_controls - passing - failing, 0)
+            passing = len(passed_controls)
+            failing = len(failed_controls)
+            unknown = max(total_controls - passing - failing, 0)
 
-        # Severity breakdown for failed findings
-        failed_severities = Counter(
-            (rec.get("Severity", "LOW") or "LOW").upper()
-            for rec in evidence_records
-            if rec.get("ComplianceStatus") == "FAILED"
-        )
+            # Severity breakdown for failed findings
+            failed_severities = Counter(
+                (rec.get("Severity", "LOW") or "LOW").upper()
+                for rec in evidence_records
+                if rec.get("ComplianceStatus") == "FAILED"
+            )
 
-        compliance_rate = (passing / total_controls * 100.0) if total_controls > 0 else 0.0
+            compliance_rate = (passing / total_controls * 100.0) if total_controls > 0 else 0.0
 
-        return {
-            "total_controls": total_controls,
-            "passing": passing,
-            "failing": failing,
-            "unknown": unknown,
-            "compliance_rate": compliance_rate,
-            "failed_severities": failed_severities,
-        }
+            return {
+                "total_controls": total_controls,
+                "passing": passing,
+                "failing": failing,
+                "unknown": unknown,
+                "compliance_rate": compliance_rate,
+                "failed_severities": failed_severities,
+            }
 
     def _build_email_body(self, evidence_records, presigned_url: str) -> str:
-        """
-        Build an AWS-Access-Review-style email body:
-        - Title
-        - Executive Summary
-        - Key Recommendations
-        - Next Steps
-        """
-        metrics = self._compute_summary_metrics(evidence_records)
+            """
+            Build an AWS-Access-Review-style email body:
+            - Title
+            - Executive Summary
+            - Key Recommendations
+            - Next Steps
+            """
+            metrics = self._compute_summary_metrics(evidence_records)
 
-        total = metrics["total_controls"]
-        passing = metrics["passing"]
-        failing = metrics["failing"]
-        unknown = metrics["unknown"]
-        rate = metrics["compliance_rate"]
-        failed_severities = metrics["failed_severities"]
+            total = metrics["total_controls"]
+            passing = metrics["passing"]
+            failing = metrics["failing"]
+            unknown = metrics["unknown"]
+            rate = metrics["compliance_rate"]
+            failed_severities = metrics["failed_severities"]
 
-        crit = failed_severities.get("CRITICAL", 0)
-        high = failed_severities.get("HIGH", 0)
-        medium = failed_severities.get("MEDIUM", 0)
-        low = failed_severities.get("LOW", 0)
+            crit = failed_severities.get("CRITICAL", 0)
+            high = failed_severities.get("HIGH", 0)
+            medium = failed_severities.get("MEDIUM", 0)
+            low = failed_severities.get("LOW", 0)
 
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
 
-        body = f"""AWS Access Review Report
+            body = f"""AWS Access Review Report
 
-# AWS Access Review Report
+    # AWS Access Review Report
 
-## Executive Summary
+    ## Executive Summary
 
-This automated weekly report summarizes the current SOC 2 control posture for your AWS environment as of {today_str}.
+    This automated weekly report summarizes the current SOC 2 control posture for your AWS environment as of {today_str}.
 
-- Total controls evaluated: {total}
-- Passing controls: {passing}
-- Failing controls: {failing}
-- Unknown / manual review: {unknown}
-- Overall compliance rate: {rate:.1f}%
+    - Total controls evaluated: {total}
+    - Passing controls: {passing}
+    - Failing controls: {failing}
+    - Unknown / manual review: {unknown}
+    - Overall compliance rate: {rate:.1f}%
 
-Failed findings by severity:
-- Critical: {crit}
-- High: {high}
-- Medium: {medium}
-- Low: {low}
+    Failed findings by severity:
+    - Critical: {crit}
+    - High: {high}
+    - Medium: {medium}
+    - Low: {low}
 
-## Key Recommendations
+    ## Key Recommendations
 
-1. **High Priority:** Review all controls with Critical or High severity failed findings and create remediation tasks for each.
-2. **Medium Priority:** Address Medium severity findings as part of your regular sprint or weekly maintenance cycle.
-3. **Low Priority:** Track Low severity issues for long-term hardening and defense-in-depth improvements.
-4. **Ongoing:** Maintain regular evidence collection, report reviews, and configuration monitoring to prevent control drift.
+    1. **High Priority:** Review all controls with Critical or High severity failed findings and create remediation tasks for each.
+    2. **Medium Priority:** Address Medium severity findings as part of your regular sprint or weekly maintenance cycle.
+    3. **Low Priority:** Track Low severity issues for long-term hardening and defense-in-depth improvements.
+    4. **Ongoing:** Maintain regular evidence collection, report reviews, and configuration monitoring to prevent control drift.
 
-## Next Steps
+    ## Next Steps
 
-For detailed findings and specific recommendations, please review the attached CSV report or download it using the link below:
+    For detailed findings and specific recommendations, please review the attached CSV report or download it using the link below:
 
-{presigned_url}
+    {presigned_url}
 
-If this report was generated as part of a demo environment, replace the recipient list with your production security and GRC contacts.
+    If this report was generated as part of a demo environment, replace the recipient list with your production security and GRC contacts.
 
----
-This report was generated automatically by the FAFO Continuous Compliance engine.
-"""
+    ---
+    This report was generated automatically by the FAFO Continuous Compliance engine.
+    """
 
-        return body
+            return body
 
     def send_notification(self, s3_key, summary):
-        """
-        Send an executive-style email summary + CSV download link.
+            """
+            Send an executive-style email summary + CSV download link.
 
-        `summary` is the dict returned by build_summary().
-        """
-        # Generate presigned URL to the CSV summary
-        presigned_url = self.s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": self.s3_bucket, "Key": s3_key},
-            ExpiresIn=604800,  # 7 days
-        )
+            `summary` is the dict returned by build_summary().
+            """
+            # Generate presigned URL to the CSV summary
+            presigned_url = self.s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.s3_bucket, "Key": s3_key},
+                ExpiresIn=604800,  # 7 days
+            )
 
-        today = datetime.now().strftime("%Y-%m-%d")
-        subject = f"Weekly SOC 2 Audit Summary – {today}"
+            today = datetime.now().strftime("%Y-%m-%d")
+            subject = f"Weekly SOC 2 Audit Summary – {today}"
 
-        # Ask Claude (via Bedrock) for Key Recommendations
-        ai_exec_summary = self.build_ai_exec_summary(summary)
-        ai_recommendations = self.build_ai_recommendations(summary)
+            # Ask Claude (via Bedrock) for Key Recommendations
+            ai_exec_summary = self.build_ai_exec_summary(summary)
+            ai_recommendations = self.build_ai_recommendations(summary)
 
-        body = f"""Weekly SOC 2 Audit Summary – {today}
+            body = f"""Weekly SOC 2 Audit Summary – {today}
 
-# Weekly SOC 2 Audit Summary
+    # Weekly SOC 2 Audit Summary
 
-## AI Executive Summary
-{ai_exec_summary}
+    ## AI Executive Summary
+    {ai_exec_summary}
 
-## Key Recommendations
+    ## Key Recommendations
 
-{ai_recommendations}
+    {ai_recommendations}
 
-## Next Steps
+    ## Next Steps
 
-Download the detailed CSV evidence summary:
-{presigned_url}
+    Download the detailed CSV evidence summary:
+    {presigned_url}
 
-For each failing control, confirm ownership, create remediation tickets,
-and track progress in your GRC backlog.
+    For each failing control, confirm ownership, create remediation tickets,
+    and track progress in your GRC backlog.
 
----
+    ---
 
-This report was generated automatically by the FAFO Continuous Compliance engine.
-"""
+    This report was generated automatically by the FAFO Continuous Compliance engine.
+    """
 
-        self.ses.send_email(
-            Source=self.sender_email,
-            Destination={"ToAddresses": self.report_recipients},
-            Message={
-                "Subject": {"Data": subject},
-                "Body": {"Text": {"Data": body}},
-            },
-        )
-        logger.info(
-            "Sent notifications to %d recipients", len(self.report_recipients)
-        )
+            self.ses.send_email(
+                Source=self.sender_email,
+                Destination={"ToAddresses": self.report_recipients},
+                Message={
+                    "Subject": {"Data": subject},
+                    "Body": {"Text": {"Data": body}},
+                },
+            )
+            logger.info(
+                "Sent notifications to %d recipients", len(self.report_recipients)
+            )
 
 # -------------------------------------------------------------------
 # Lambda entry point
