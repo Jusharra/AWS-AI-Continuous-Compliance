@@ -153,7 +153,7 @@ def format_context_for_prompt(matches: List[Dict[str, Any]]) -> str:
 # -----------------------------
 
 SYSTEM_PROMPT = """
-You are a senior GRC engineer answering auditor-style questions using SOC 2 and ISO 27001 evidence from Pinecone.
+You are a senior GRC engineer answering comprehensive auditor-style questions using SOC 2 and ISO 27001 evidence from Pinecone.
 
 Rules:
 - Always ground answers in the retrieved chunks (Security Hub, Config, Audit Manager, weekly CSVs, remediation JSON).
@@ -230,7 +230,7 @@ def main():
         layout="wide",
     )
 
-    st.title("FAFO Continuous Compliance – Auditor Q&A")
+    st.title("FAFO Inc. Continuous Compliance – Auditor Q&A")
     st.caption(
         "Ask questions about SOC 2 / ISO 27001 controls, logical access, change management, "
         "system operations, availability, and confidentiality. Backed by AWS evidence & RAG."
